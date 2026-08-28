@@ -1,7 +1,10 @@
-"""Smoke test for agent.models -- creates one row per table and reads it back."""
+"""Tests for agent.models -- schema smoke test plus a concurrency
+regression test for the session-factory cache's first-use race.
+"""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
 
 from agent.models import Crew, Decision, Reading, Score, Site, db_session
@@ -93,3 +96,28 @@ def test_create_and_read_one_row_per_table(tmp_path):
         assert decisions[0].score_id == scores[0].id
         assert decisions[0].trigger_type == "live"
         assert decisions[0].report_url is None
+
+
+def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):
+    """Regression test: concurrent first-time db_session() calls against the
+    same not-yet-cached URL used to race on Base.metadata.create_all(),
+    intermittently raising "table already exists" and dropping rows.
+    """
+    database_url = f"sqlite:///{tmp_path / 'concurrent.db'}"
+
+    def _write_one(i: int) -> None:
+        with db_session(database_url) as session:
+            session.add(
+                Site(
+                    name=f"Site {i}",
+                    lat=0.0,
+                    lon=0.0,
+                    polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+                )
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(_write_one, range(8)))
+
+    with db_session(database_url) as session:
+        assert len(session.query(Site).all()) == 8

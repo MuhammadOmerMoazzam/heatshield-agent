@@ -21,6 +21,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
+from dotenv import load_dotenv
+
+# So FORTYGUARD_API_KEY/FORTYGUARD_BASE_URL from .env are actually picked
+# up, not just documented in .env.example -- load_dotenv() only sets keys
+# not already in os.environ, so a real shell-exported var still wins.
+load_dotenv()
 
 DEFAULT_BASE_URL = "https://api.fortyguard.com"
 _TERMINAL_SUCCESS = {"completed", "succeeded"}

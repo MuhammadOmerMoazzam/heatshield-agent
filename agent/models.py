@@ -8,9 +8,12 @@ project's audit log -- every action the agent takes writes one.
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -23,13 +26,25 @@ from sqlalchemy import (
     Time,
     create_engine,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+# So DATABASE_URL from .env is actually picked up, not just documented in
+# .env.example -- load_dotenv() only sets keys not already in os.environ,
+# so a real shell-exported var still wins.
+load_dotenv()
 
 Base = declarative_base()
 
-DEFAULT_DATABASE_URL = "sqlite:///data/heatshield.db"
+# Anchored to this package's location, not the process's CWD -- a
+# scheduler job, `streamlit run`, or pytest launched from a different
+# directory would otherwise silently read/write a different data/
+# heatshield.db than intended.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATABASE_URL = f"sqlite:///{(_REPO_ROOT / 'data' / 'heatshield.db').as_posix()}"
 
 _session_factories: dict[str, sessionmaker] = {}
+_session_factories_lock = threading.Lock()
 
 
 class Site(Base):
@@ -105,16 +120,23 @@ def _resolve_database_url() -> str:
 
 
 def _get_session_factory(database_url: str) -> sessionmaker:
-    if database_url not in _session_factories:
-        if database_url.startswith("sqlite:///"):
-            db_path = database_url[len("sqlite:///"):]
-            if db_path and db_path != ":memory:":
-                parent = os.path.dirname(db_path)
+    # Fast path: no lock needed once a URL is cached. Double-checked
+    # locking on the slow path -- without it, concurrent first-time calls
+    # for the same URL (e.g. two APScheduler jobs starting together) each
+    # create their own Engine and race on Base.metadata.create_all(),
+    # which can crash with "table already exists" and drop rows.
+    if database_url in _session_factories:
+        return _session_factories[database_url]
+    with _session_factories_lock:
+        if database_url not in _session_factories:
+            url_obj = make_url(database_url)
+            if url_obj.get_backend_name() == "sqlite" and url_obj.database not in (None, ":memory:"):
+                parent = os.path.dirname(url_obj.database)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
-        engine = create_engine(database_url)
-        Base.metadata.create_all(engine)
-        _session_factories[database_url] = sessionmaker(bind=engine)
+            engine = create_engine(database_url)
+            Base.metadata.create_all(engine)
+            _session_factories[database_url] = sessionmaker(bind=engine)
     return _session_factories[database_url]
 
 
