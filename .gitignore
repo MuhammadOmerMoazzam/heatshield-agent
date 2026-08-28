@@ -16,6 +16,7 @@ dist/
 # Tooling caches
 .pytest_cache/
 
-# Local database — keep the directory, ignore the file
-data/*.db
-data/*.sqlite3
+# Local database — keep the directory, ignore the file and its
+# WAL/SHM/journal sidecars (e.g. heatshield.db-wal)
+data/*.db*
+data/*.sqlite3*
