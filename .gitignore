@@ -1,0 +1,21 @@
+# Environments
+.venv/
+venv/
+.env
+
+# Streamlit secrets (Part E)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+
+# Local database — keep the directory, ignore the file
+data/*.db
+data/*.sqlite3
