@@ -29,6 +29,7 @@ needed ("once per process," not "once per session").
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -40,6 +41,35 @@ from agent.models import Decision, Reading, Score, Site, db_session
 _bootstrap_lock = threading.Lock()
 _scheduler_started = False
 _scheduler_handle = None
+
+
+def _load_secrets_into_environ() -> None:
+    """Copy Streamlit Cloud secrets (st.secrets) into os.environ, once per
+    call, without overriding anything already set.
+
+    st.secrets is a separate mechanism from os.environ -- Cloud secrets
+    configured in its UI are NOT injected into the environment
+    automatically, so every other module's plain os.getenv(...) calls
+    (agent/fortyguard_client.py, agent/act/notify.py, agent/models.py --
+    the pattern the build plan specifies for local dev via python-dotenv)
+    would silently see nothing on Cloud even with secrets correctly set.
+    Doing this once, here, keeps agent/ itself environment-agnostic -- it
+    never needs to know about Streamlit, on Cloud or locally.
+
+    Locally (a .env file, no .streamlit/secrets.toml) st.secrets raises
+    rather than returning empty -- that's the normal local-dev case, not
+    an error, so it's swallowed: .env's values are already in os.environ
+    by the time this runs (python-dotenv's load_dotenv(), called at
+    import time in fortyguard_client.py/models.py). Existing os.environ
+    values always win, mirroring load_dotenv()'s own documented
+    precedence elsewhere in this codebase.
+    """
+    try:
+        secrets_items = list(st.secrets.items())
+    except Exception:
+        return
+    for key, value in secrets_items:
+        os.environ.setdefault(key, str(value))
 
 
 def bootstrap_agent_loop():
@@ -275,6 +305,7 @@ def render_decision_log(decisions: list[dict]) -> None:
 
 
 def main() -> None:
+    _load_secrets_into_environ()
     st.set_page_config(page_title="HeatShield Agent", layout="wide")
     bootstrap_agent_loop()
     st.title("HeatShield Agent — Site Risk Dashboard")
