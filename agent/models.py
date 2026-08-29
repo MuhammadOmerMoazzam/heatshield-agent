@@ -144,7 +144,14 @@ def _get_session_factory(database_url: str) -> sessionmaker:
                     os.makedirs(parent, exist_ok=True)
             engine = create_engine(database_url)
             Base.metadata.create_all(engine)
-            _session_factories[database_url] = sessionmaker(bind=engine)
+            # expire_on_commit=False: db_session() closes its session
+            # immediately after commit (see below), and callers like
+            # agent.loop.run_once() return ORM rows straight out of that
+            # `with` block -- with the default expire_on_commit=True,
+            # every attribute on those rows would raise
+            # DetachedInstanceError the instant a caller touched a field,
+            # since the session that could re-fetch them is already gone.
+            _session_factories[database_url] = sessionmaker(bind=engine, expire_on_commit=False)
     return _session_factories[database_url]
 
 

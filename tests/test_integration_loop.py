@@ -11,9 +11,12 @@ from __future__ import annotations
 from datetime import time
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.fortyguard_client import TaskFailedError
-from agent.loop import run_cycle, run_once
+from agent.loop import _check_credits, run_cycle, run_once, run_scheduler
 from agent.models import Crew, Reading, Score, Site, db_session
+from agent.sense import sense_live
 
 HOUSTON_POLYGON = {
     "type": "FeatureCollection",
@@ -175,6 +178,14 @@ def test_full_cycle_safe_reading_produces_no_side_effects(tmp_path, mocker):
 
 
 def test_full_cycle_extreme_reading_produces_halt_alert_and_report(tmp_path, mocker):
+    """The live branch halts work, notifies, and reports. The forecast
+    branch (same underlying heatmap data, since the mocked client returns
+    the same extreme reading for both the "now" and "now+12h" calls) is
+    intentionally different per decide.py's forecast redesign: it flags a
+    reschedule and sends a heads-up notification, but never halts work or
+    requests a compliance report for a condition that hasn't happened yet
+    (Part B.2's proactive-branch design; see decide.py's FORECAST_ACTION_MAP).
+    """
     notify_mock = mocker.patch("agent.act.notify.notify_slack", return_value="slack")
     schedule_mock = mocker.patch("agent.act.schedule.write_shift_override")
     report_mock = mocker.patch(
@@ -195,11 +206,15 @@ def test_full_cycle_extreme_reading_produces_halt_alert_and_report(tmp_path, moc
         forecast_decision = next(d for d in decisions if d.trigger_type == "forecast")
 
         assert live_decision.action_taken == "halt_and_notify_and_report"
-        assert forecast_decision.action_taken == "halt_and_notify_and_report"
+        assert live_decision.report_url == "/outputs/r.pdf"
+        assert forecast_decision.action_taken == "flag_for_reschedule_and_notify"
+        assert forecast_decision.report_url is None
 
+    # Both branches notify + schedule (once each); only the live branch
+    # ever requests a compliance report.
     assert notify_mock.call_count == 2
     assert schedule_mock.call_count == 2
-    assert report_mock.call_count == 2
+    assert report_mock.call_count == 1
 
 
 def test_credit_usage_checked_before_cycle_runs_and_throttles_if_low(tmp_path, mocker):
@@ -270,3 +285,202 @@ def test_one_site_failing_does_not_skip_the_rest_of_the_cycle(tmp_path, mocker):
             reading_row = session.get(Reading, score_row.reading_id)
             site_ids_covered.add(reading_row.site_id)
         assert site_ids_covered == {site1.id, site2.id}
+
+
+def test_onboarding_flush_failure_for_one_site_does_not_poison_the_rest_of_the_cycle(
+    tmp_path, mocker
+):
+    """Code-review regression: SQLAlchemy 2.0's Session._flush() leaves the
+    session INACTIVE on any flush error, requiring an explicit rollback
+    before it's usable again -- but a plain session.rollback() would undo
+    every *other* site's already-flushed work in the same cycle too, since
+    nothing commits until db_session()'s single commit at the very end.
+    Forces a genuine flush failure (a NOT NULL violation, not a mocked
+    exception) for site 1's onboarding step and confirms site 2 still
+    completes -- this is what a naive session.rollback() would get wrong.
+    """
+    mocker.patch("agent.act.notify.notify_slack")
+    mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch("agent.act.compliance_report.generate_compliance_report")
+
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result()
+    client.environmental_parameters.return_value = _env_params_result()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site1, _ = _seed(session)
+        site2, _ = _seed_second_site(session)
+
+        def _break_session_flush(client, site):
+            session.add(
+                Reading(
+                    site_id=site.id,
+                    ts=None,  # nullable=False -> real IntegrityError on flush
+                    heat_index=1.0,
+                    humidity=1.0,
+                    solar_irradiance=1.0,
+                    is_forecast=False,
+                )
+            )
+            session.flush()
+
+        mocker.patch("agent.loop.onboard_site", side_effect=_break_session_flush)
+
+        decisions = run_cycle(session, client, skip_onboarding=False)
+
+        # Both sites' one crew each got a live + forecast decision --
+        # site 1's onboarding flush failure didn't take site 2 down too.
+        assert len(decisions) == 4
+        site_ids = set()
+        for decision in decisions:
+            score_row = session.get(Score, decision.score_id)
+            reading_row = session.get(Reading, score_row.reading_id)
+            site_ids.add(reading_row.site_id)
+        assert site_ids == {site1.id, site2.id}
+
+
+def test_sense_flush_failure_for_one_site_does_not_poison_the_rest_of_the_cycle(
+    tmp_path, mocker
+):
+    """Same regression as above, forced inside the sense/score/decide
+    except block instead of the onboarding one.
+    """
+    mocker.patch("agent.act.notify.notify_slack")
+    mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch("agent.act.compliance_report.generate_compliance_report")
+
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result()
+    client.environmental_parameters.return_value = _env_params_result()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site1, _ = _seed(session)
+        site2, _ = _seed_second_site(session)
+
+        real_sense_live = sense_live
+
+        def _break_on_site1(client_, site):
+            if site.id == site1.id:
+                session.add(
+                    Reading(
+                        site_id=site.id,
+                        ts=None,  # real IntegrityError on flush
+                        heat_index=1.0,
+                        humidity=1.0,
+                        solar_irradiance=1.0,
+                        is_forecast=False,
+                    )
+                )
+                session.flush()
+            return real_sense_live(client_, site)
+
+        mocker.patch("agent.loop.sense_live", side_effect=_break_on_site1)
+
+        decisions = run_cycle(session, client, skip_onboarding=True)
+
+        # Site 1 fails entirely (its own flush error), but site 2's crew
+        # still gets a live + forecast decision.
+        assert len(decisions) == 2
+        for decision in decisions:
+            score_row = session.get(Score, decision.score_id)
+            reading_row = session.get(Reading, score_row.reading_id)
+            assert reading_row.site_id == site2.id
+
+
+def test_forecast_sensing_failure_still_returns_live_branch_decisions(tmp_path, mocker):
+    """Code-review regression: sense_forecast raising after the live branch
+    already succeeded used to propagate out of _run_site_cycle before its
+    `return decisions`, silently discarding the live branch's already-
+    decided rows from run_cycle's return value (the DB rows themselves
+    were fine -- only the caller-visible count was wrong).
+    """
+    mocker.patch("agent.act.notify.notify_slack")
+    mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch("agent.act.compliance_report.generate_compliance_report")
+    mocker.patch("agent.loop.sense_forecast", side_effect=TaskFailedError("forecast AOI rejected"))
+
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(mean_temp_c=25.0)
+    client.environmental_parameters.return_value = _env_params_result(
+        heat_index_c=25.0, humidity=40.0, ghi=300.0, aqi=20.0
+    )
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        _seed(session)
+
+        decisions = run_cycle(session, client, skip_onboarding=True)
+
+        # One crew -> one live decision, even though the forecast branch
+        # for the same site failed.
+        assert len(decisions) == 1
+        assert decisions[0].trigger_type == "live"
+
+
+def test_run_once_decisions_survive_after_db_session_closes(tmp_path, mocker):
+    """Code-review regression: db_session()'s sessionmaker defaulted to
+    SQLAlchemy's expire_on_commit=True, so every attribute on the Decision
+    rows run_once() returns was expired -- and then unreadable, since the
+    session that could refresh them was already closed -- the instant a
+    caller touched a field after the `with db_session(...)` block inside
+    run_once() exited.
+    """
+    mocker.patch("agent.act.notify.notify_slack")
+    mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch("agent.act.compliance_report.generate_compliance_report")
+    mocker.patch("agent.loop.onboard_site")
+
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(mean_temp_c=25.0, max_temp_c=26.0)
+    client.environmental_parameters.return_value = _env_params_result(
+        heat_index_c=25.0, humidity=40.0, ghi=300.0, aqi=20.0
+    )
+    client.fetch_api_key_usage.return_value = _usage_result(remaining_credits=1_000_000)
+
+    db_url = f"sqlite:///{tmp_path / 't.db'}"
+    with db_session(db_url) as session:
+        _seed(session)
+
+    decisions = run_once(client=client, database_url=db_url, credit_floor=10_000)
+
+    # No db_session() block open here -- this must not raise
+    # DetachedInstanceError.
+    assert decisions[0].action_taken == "none"
+    assert decisions[0].trigger_type in ("live", "forecast")
+
+
+def test_check_credits_does_not_throttle_on_unusable_response():
+    """Code-review regression: `remaining >= credit_floor` sat outside
+    _check_credits' try/except, so a present-but-non-numeric
+    remaining_credits value raised an uncaught TypeError instead of
+    falling back to "don't throttle" like the docstring promises for any
+    unrecognized response.
+    """
+    client = MagicMock()
+    client.fetch_api_key_usage.return_value = {"remaining_credits": "not-a-number"}
+
+    assert _check_credits(client, credit_floor=1000) is True
+
+
+def test_run_scheduler_rejects_zero_check_credits_every_n_cycles():
+    """Code-review regression: state["cycle_count"] % check_credits_every_n_cycles
+    raises ZeroDivisionError inside the recurring job (only surfacing once
+    the scheduler actually ticks) if this is ever misconfigured as 0.
+    """
+    with pytest.raises(ValueError):
+        run_scheduler(check_credits_every_n_cycles=0)
+
+
+def test_run_scheduler_uses_utc_timezone(mocker):
+    """Code-review regression: BackgroundScheduler() with no explicit
+    timezone defaults to the host's local timezone, so the naive-UTC
+    now_naive_utc() passed as next_run_time gets localized as local time
+    instead of UTC -- on a host west of UTC, "run immediately at startup"
+    silently turns into "run several hours late".
+    """
+    mock_scheduler_cls = mocker.patch("apscheduler.schedulers.background.BackgroundScheduler")
+    mocker.patch("agent.loop.FortyGuardClient")
+
+    run_scheduler()
+
+    _, kwargs = mock_scheduler_cls.call_args
+    assert kwargs.get("timezone") == "UTC"

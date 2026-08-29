@@ -29,7 +29,7 @@ from agent.score import (
     compute_final_score,
     compute_raw_stress,
 )
-from agent.sense import _celsius_to_fahrenheit, sense_forecast, sense_live
+from agent.sense import celsius_to_fahrenheit, sense_forecast, sense_live
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +40,21 @@ DEFAULT_CHECK_CREDITS_EVERY_N_CYCLES = 10
 def _check_credits(client: FortyGuardClient, credit_floor: int) -> bool:
     """True if credits are healthy enough to run onboarding this cycle.
 
-    A usage-check failure or an unrecognized response doesn't throttle --
-    an unrelated billing-endpoint hiccup shouldn't stop the agent from
-    sensing real heat risk.
+    A usage-check failure, an unrecognized response, or a non-numeric
+    ``remaining_credits`` value doesn't throttle -- an unrelated billing-
+    endpoint hiccup shouldn't stop the agent from sensing real heat risk.
+    The comparison is inside the same try/except as the call itself so a
+    malformed value can't raise past this function uncaught.
     """
     try:
         usage = client.fetch_api_key_usage()
+        remaining = usage.get("remaining_credits")
+        if remaining is None:
+            return True
+        return remaining >= credit_floor
     except Exception:
-        logger.exception("fetch_api_key_usage failed; not throttling on it")
+        logger.exception("fetch_api_key_usage failed or returned an unusable response; not throttling on it")
         return True
-    remaining = usage.get("remaining_credits")
-    if remaining is None:
-        return True
-    return remaining >= credit_floor
 
 
 def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = False) -> list[Decision]:
@@ -74,8 +76,17 @@ def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = Fals
         # error, so there's a real, correct fallback to fall back to.
         if not skip_onboarding:
             try:
-                onboard_site(client, site)
-                session.flush()
+                # A flush failure leaves the SQLAlchemy session in an
+                # INACTIVE state (per Session._flush()'s own exception
+                # handling) requiring an explicit rollback before the
+                # session is usable again -- but a plain session.rollback()
+                # would undo *every* site processed so far in this cycle,
+                # since nothing commits until db_session()'s single commit
+                # at the very end. A SAVEPOINT (begin_nested) scopes the
+                # rollback to just this site's onboarding attempt.
+                with session.begin_nested():
+                    onboard_site(client, site)
+                    session.flush()
             except Exception:
                 logger.exception(
                     "Onboarding failed for site_id=%s (%s); proceeding without shade data.",
@@ -85,9 +96,10 @@ def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = Fals
 
         # A failure sensing/scoring THIS site (a bad heatmap, a rejected
         # AOI, etc.) must not crash the whole cycle and skip every other
-        # site -- log it and move on.
+        # site -- log it and move on. Same SAVEPOINT reasoning as above.
         try:
-            decisions.extend(_run_site_cycle(session, client, site, crews))
+            with session.begin_nested():
+                decisions.extend(_run_site_cycle(session, client, site, crews))
         except Exception:
             logger.exception(
                 "Sense/score/decide failed for site_id=%s (%s); skipping this site this cycle.",
@@ -133,36 +145,52 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
     # forecasted peak temperature is classified directly against the
     # same thresholds (Part B.2: the forecast flag "doesn't feed the live
     # score directly -- feeds a separate proactive branch").
-    forecast_signal = sense_forecast(client, site)
-    forecast_temp_f = _celsius_to_fahrenheit(forecast_signal.max_temp_c)
-    forecast_reading = Reading(
-        site_id=site.id,
-        ts=forecast_signal.ts,
-        heat_index=forecast_temp_f,
-        aqi=None,
-        # No env_params call for a forecast -- these aren't real
-        # measurements. is_forecast=True is the flag that says so.
-        humidity=0.0,
-        solar_irradiance=0.0,
-        is_forecast=True,
-        heatmap_geojson=forecast_signal.heatmap_geojson,
-    )
-    session.add(forecast_reading)
-    session.flush()
-
-    forecast_tier = classify_risk_tier(forecast_temp_f)
-    for crew in crews:
-        decisions.append(
-            decide_and_act(
-                session,
-                client,
-                site,
-                crew,
-                forecast_reading,
-                forecast_temp_f,
-                forecast_tier,
-                "forecast",
+    #
+    # Isolated in its own try/except + SAVEPOINT: a forecast-sensing
+    # failure (a rejected AOI, a server-side task failure) must not
+    # discard the live branch's already-flushed rows above -- a plain
+    # session.rollback() here would undo the live branch's work too,
+    # since both branches share this same uncommitted transaction; a
+    # SAVEPOINT scopes the rollback to just the forecast branch.
+    try:
+        with session.begin_nested():
+            forecast_signal = sense_forecast(client, site)
+            forecast_temp_f = celsius_to_fahrenheit(forecast_signal.max_temp_c)
+            forecast_reading = Reading(
+                site_id=site.id,
+                ts=forecast_signal.ts,
+                heat_index=forecast_temp_f,
+                aqi=None,
+                # No env_params call for a forecast -- these aren't real
+                # measurements. is_forecast=True is the flag that says so.
+                humidity=0.0,
+                solar_irradiance=0.0,
+                is_forecast=True,
+                heatmap_geojson=forecast_signal.heatmap_geojson,
             )
+            session.add(forecast_reading)
+            session.flush()
+
+            forecast_tier = classify_risk_tier(forecast_temp_f)
+            for crew in crews:
+                decisions.append(
+                    decide_and_act(
+                        session,
+                        client,
+                        site,
+                        crew,
+                        forecast_reading,
+                        forecast_temp_f,
+                        forecast_tier,
+                        "forecast",
+                    )
+                )
+    except Exception:
+        logger.exception(
+            "Forecast sensing/scoring failed for site_id=%s (%s); live-branch decisions for "
+            "this site are still returned.",
+            site.id,
+            site.name,
         )
 
     return decisions
@@ -196,6 +224,11 @@ def run_scheduler(
     """Start a background APScheduler job running run_cycle() on a fixed
     interval, checking credits at startup and every N cycles thereafter.
     """
+    if check_credits_every_n_cycles < 1:
+        raise ValueError(
+            f"check_credits_every_n_cycles must be >= 1, got {check_credits_every_n_cycles!r}"
+        )
+
     from apscheduler.schedulers.background import BackgroundScheduler
 
     client = FortyGuardClient()
@@ -208,7 +241,12 @@ def run_scheduler(
         with db_session() as session:
             run_cycle(session, client, skip_onboarding=not state["credits_ok"])
 
-    scheduler = BackgroundScheduler()
+    # timezone="UTC": BackgroundScheduler() with no explicit timezone
+    # defaults to the host's local tz (apscheduler/schedulers/base.py),
+    # which would localize the naive-UTC now_naive_utc() below as if it
+    # were already local time -- "run immediately at startup" silently
+    # becomes "run several hours late" on any host west of UTC.
+    scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(_job, "interval", minutes=interval_minutes, next_run_time=now_naive_utc())
     scheduler.start()
     return scheduler

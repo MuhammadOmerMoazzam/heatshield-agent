@@ -187,6 +187,57 @@ def test_forecast_flag_triggers_proactive_branch_not_live_branch(tmp_path, mocke
         assert live_decision.id != forecast_decision.id
 
 
+@pytest.mark.parametrize("tier", ["high", "extreme"])
+def test_forecast_high_or_extreme_flags_reschedule_without_halting_or_reporting(
+    tmp_path, mocker, tier
+):
+    """Code-review-driven redesign: a +12h *forecast* crossing high/extreme
+    must not fire the same real halt-work order, emergency-worded Slack
+    alert, and heat_intelligence report request that a LIVE reading at
+    that tier fires -- nothing has actually happened yet (Part B.2: the
+    forecast branch is proactive/precautionary, "pre-emptively reschedule
+    tonight", not a live emergency response). It still notifies (a
+    clearly-forecast-labeled heads-up) and still flags the shift for
+    reschedule, but never calls generate_compliance_report -- heat_intelligence
+    reports on measured conditions, and this reading's timestamp is a
+    prediction, not something that has happened.
+    """
+    notify_mock, schedule_mock, report_mock = _patch_actions(mocker, notify_return="slack")
+    client = MagicMock()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site, crew, reading = _seed(session)
+        decision = decide_and_act(
+            session, client, site, crew, reading, score=999.0, tier=tier, trigger_type="forecast"
+        )
+        assert decision.action_taken == "flag_for_reschedule_and_notify"
+        assert decision.notified_channel == "slack"
+        assert decision.report_url is None
+
+    notify_mock.assert_called_once()
+    assert "FORECAST" in notify_mock.call_args.args[0]
+    schedule_mock.assert_called_once()
+    assert schedule_mock.call_args.args[2] == "flag_for_reschedule"
+    report_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("tier", ["safe", "caution"])
+def test_forecast_safe_or_caution_takes_no_action(tmp_path, mocker, tier):
+    notify_mock, schedule_mock, report_mock = _patch_actions(mocker)
+    client = MagicMock()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site, crew, reading = _seed(session)
+        decision = decide_and_act(
+            session, client, site, crew, reading, score=1.0, tier=tier, trigger_type="forecast"
+        )
+        assert decision.action_taken == "none"
+
+    notify_mock.assert_not_called()
+    schedule_mock.assert_not_called()
+    report_mock.assert_not_called()
+
+
 def test_decision_still_logged_when_an_action_fails(tmp_path, mocker):
     """Regression test: a failing notify/schedule/report call used to
     propagate out of decide_and_act and roll back the already-flushed

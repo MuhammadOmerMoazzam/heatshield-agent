@@ -20,7 +20,19 @@ notified_channel/report_url reflecting what actually happened.
 Per Part D's Phase 6 prompt and the C.5 test contract (both explicit and
 in agreement -- Part B.3's higher-level narrative summary just doesn't
 spell out every side effect), the compliance report fires on *both*
-high and extreme tiers, not extreme alone.
+high and extreme tiers, not extreme alone -- for a *live* reading.
+
+A forecast (+12h) reading uses a deliberately different, smaller action
+set (FORECAST_ACTION_MAP) than a live one at the same tier: a merely
+*predicted* "extreme" hasn't happened yet, so it must never fire the
+same real halt-work order, emergency-worded Slack alert, and
+heat_intelligence report request that an active live "extreme" fires
+right now -- that would be, in effect, paging someone for an emergency
+that may not occur. Part B.2 frames the forecast branch as proactive/
+precautionary ("tomorrow's 6am shift is forecast to cross 'high' --
+pre-emptively reschedule tonight"), not a live-equivalent response, and
+heat_intelligence itself reports on *measured* conditions -- a
+future-dated request against it isn't valid input regardless of tier.
 """
 
 from __future__ import annotations
@@ -40,6 +52,17 @@ ACTION_MAP: dict[str, str] = {
     "caution": "break_reminders",
     "high": "shorten_shift_and_notify",
     "extreme": "halt_and_notify_and_report",
+}
+
+# A forecast at "caution" isn't urgent enough to pre-schedule around --
+# only a forecasted high/extreme (Part B.2's own "high" example) triggers
+# a proactive reschedule flag + heads-up notification. Neither ever halts
+# work or requests a compliance report; see the module docstring.
+FORECAST_ACTION_MAP: dict[str, str] = {
+    "safe": "none",
+    "caution": "none",
+    "high": "flag_for_reschedule_and_notify",
+    "extreme": "flag_for_reschedule_and_notify",
 }
 
 
@@ -65,12 +88,14 @@ def decide_and_act(
     trigger_type: str,
 ) -> Decision:
     """Classify -> act -> log, for one crew's reading against one site."""
-    if tier not in ACTION_MAP:
+    is_forecast = trigger_type == "forecast"
+    action_map = FORECAST_ACTION_MAP if is_forecast else ACTION_MAP
+    if tier not in action_map:
         raise ValueError(
             f"Unknown risk tier {tier!r} for site_id={site.id} crew_id={crew.id} "
-            f"reading_id={reading.id} -- expected one of {tuple(ACTION_MAP)}."
+            f"reading_id={reading.id} -- expected one of {tuple(action_map)}."
         )
-    action = ACTION_MAP[tier]
+    action = action_map[tier]
 
     score_row = Score(
         reading_id=reading.id,
@@ -84,7 +109,16 @@ def decide_and_act(
     notified_channel = None
     report_url = None
 
-    if tier == "caution":
+    if is_forecast:
+        if tier in ("high", "extreme"):
+            notified_channel = _try_act(
+                notify.notify_slack,
+                f"[FORECAST +12h] {site.name}: crew {crew.id} predicted to reach "
+                f"'{tier}' within 12h -> {action}",
+            )
+            _try_act(schedule.write_shift_override, site.id, crew.id, "flag_for_reschedule")
+        # No compliance report for a forecast -- see module docstring.
+    elif tier == "caution":
         _try_act(schedule.write_shift_override, site.id, crew.id, "break_reminders")
     elif tier in ("high", "extreme"):
         notified_channel = _try_act(

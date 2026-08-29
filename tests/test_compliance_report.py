@@ -83,6 +83,23 @@ def test_report_url_attached_to_decision_record(tmp_path, mocker, tier):
         assert decision.report_url == "/outputs/heat_intelligence_xyz.pdf"
 
 
+def test_heat_intelligence_call_uses_extended_timeout():
+    """Code-review regression: heat_intelligence is the same slow async
+    submit-then-poll pattern that made onboarding's satellite/streetview
+    calls time out at the client's 60s default (fixed in Phase 7) -- fired
+    on every high/extreme decision, not just once per site, so it needs
+    the same extended timeout, not just those two endpoints.
+    """
+    client = MagicMock()
+    client.heat_intelligence.return_value = "/outputs/r.pdf"
+
+    generate_compliance_report(client, _site(), _reading(), "extreme")
+
+    call = client.heat_intelligence.call_args
+    assert call.kwargs["timeout"] is not None
+    assert call.kwargs["timeout"] >= 300.0
+
+
 def test_report_call_uses_timestamp_matching_the_triggering_heatmap_call():
     client = MagicMock()
     client.heat_intelligence.return_value = "/outputs/r.pdf"

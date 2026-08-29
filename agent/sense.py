@@ -60,7 +60,7 @@ class SenseDataUnavailableError(Exception):
     """A required environmental parameter came back null from the API."""
 
 
-def _celsius_to_fahrenheit(celsius: float) -> float:
+def celsius_to_fahrenheit(celsius: float) -> float:
     return celsius * 9 / 5 + 32
 
 
@@ -110,7 +110,7 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
     return RawReading(
         site_id=site.id,
         ts=ts,
-        heat_index=_celsius_to_fahrenheit(heat_index_c),
+        heat_index=celsius_to_fahrenheit(heat_index_c),
         aqi=aqi,
         humidity=humidity,
         solar_irradiance=ghi,
