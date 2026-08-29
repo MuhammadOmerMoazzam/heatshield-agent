@@ -105,6 +105,12 @@ class SenseDataUnavailableError(Exception):
 # retrying forever" policy.
 LIVE_LOOKBACK_HOURS: tuple[int, ...] = (0, 1, 2)
 
+# Live-verified (Phase 9): a real environmental_parameters call hit
+# TaskTimeoutError at the client's 60s default -- the same class of
+# slow-async-task issue Phase 7 fixed for satellite/streetview/
+# heat_intelligence, now applied to every call this module makes too.
+_SENSE_TIMEOUT = 300.0
+
 
 def celsius_to_fahrenheit(celsius: float) -> float:
     return celsius * 9 / 5 + 32
@@ -129,6 +135,7 @@ def _fetch_live_temperature(
             start_date=candidate_ts.date().isoformat(),
             start_time=candidate_ts.strftime("%H:%M"),
             filter_type=1,
+            timeout=_SENSE_TIMEOUT,
         )
         temperature_stats = heatmap_response.get("result", {}).get("stats_data", {}).get(
             "temperature_stats"
@@ -144,6 +151,7 @@ def _fetch_live_temperature(
         site.polygon_geojson,
         start_date=base_now.date().isoformat(),
         filter_type=3,
+        timeout=_SENSE_TIMEOUT,
     )
     day_temperature_stats = day_response.get("result", {}).get("stats_data", {}).get(
         "temperature_stats"
@@ -181,6 +189,7 @@ def _fetch_live_environmental_parameters(
             site.lon,
             temperature=mean_temp_c,
             reference_ts=candidate_ts,
+            timeout=_SENSE_TIMEOUT,
         )
         location = env_response["result"]["locations"][0]
         parameters = location["parameters"]
@@ -230,6 +239,13 @@ def sense_forecast(
 ) -> ForecastSignal:
     """Sense the +12h forecast: heatmap only, no env_params call, since the
     handbook doesn't guarantee forecast support there.
+
+    A forecast necessarily queries a not-yet-elapsed hour, so the same
+    "succeeds but empty" lag sense_live's hourly queries show (see module
+    docstring) can hit this specific forecasted hour too -- if anything,
+    even more likely, since it hasn't happened yet. Falls back to that
+    target day's day-level peak rather than raising the raw KeyError this
+    used to surface as.
     """
     ts = (now or _now_naive_utc()) + timedelta(hours=12)
 
@@ -238,10 +254,38 @@ def sense_forecast(
         start_date=ts.date().isoformat(),
         start_time=ts.strftime("%H:%M"),
         filter_type=1,
+        timeout=_SENSE_TIMEOUT,
     )
-    max_temp_c = heatmap_response["result"]["stats_data"]["temperature_stats"]["maximum"]
-    heatmap_geojson = heatmap_response["result"].get("map_data")
+    temperature_stats = heatmap_response.get("result", {}).get("stats_data", {}).get(
+        "temperature_stats"
+    )
+    if temperature_stats is not None and temperature_stats.get("maximum") is not None:
+        return ForecastSignal(
+            site_id=site.id,
+            ts=ts,
+            max_temp_c=temperature_stats["maximum"],
+            heatmap_geojson=heatmap_response["result"].get("map_data"),
+        )
 
-    return ForecastSignal(
-        site_id=site.id, ts=ts, max_temp_c=max_temp_c, heatmap_geojson=heatmap_geojson
+    day_response = client.create_heatmap(
+        site.polygon_geojson,
+        start_date=ts.date().isoformat(),
+        filter_type=3,
+        timeout=_SENSE_TIMEOUT,
+    )
+    day_temperature_stats = day_response.get("result", {}).get("stats_data", {}).get(
+        "temperature_stats"
+    )
+    if day_temperature_stats is not None and day_temperature_stats.get("maximum") is not None:
+        return ForecastSignal(
+            site_id=site.id,
+            ts=ts,
+            max_temp_c=day_temperature_stats["maximum"],
+            heatmap_geojson=day_response["result"].get("map_data"),
+        )
+
+    raise SenseDataUnavailableError(
+        f"No heatmap temperature data available for site_id={site.id}'s +12h forecast "
+        f"({ts.strftime('%Y-%m-%d %H:%M')}) or that day's day-level aggregate -- FortyGuard's "
+        "pipeline may not have ingested forecast data for this site recently."
     )

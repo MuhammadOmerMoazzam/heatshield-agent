@@ -297,6 +297,65 @@ def test_sense_forecast_captures_heatmap_tile_geojson_for_dashboard():
     assert signal.heatmap_geojson == map_data
 
 
+def test_sense_forecast_falls_back_to_day_level_heatmap_when_hour_has_no_data():
+    """Live-verified (Phase 9): the same "succeeds but empty" lag that
+    affects sense_live's hourly queries can hit a specific forecasted
+    hour too (a forecast necessarily queries a not-yet-elapsed hour, so
+    FortyGuard's pipeline having nothing for it yet is, if anything, even
+    more expected). Falls back to that target day's day-level peak rather
+    than raising the raw KeyError this used to surface as.
+    """
+    client = MagicMock()
+    empty_result = {"activity_id": "hm-empty", "result": {"stats_data": {}}}
+    day_level_result = _heatmap_result(max_temp_c=39.2)
+    client.create_heatmap.side_effect = [empty_result, day_level_result]
+    site = _make_site()
+    fixed_now = datetime(2024, 7, 15, 14, 0)
+
+    signal = sense_forecast(client, site, now=fixed_now)
+
+    assert client.create_heatmap.call_count == 2
+    day_level_call = client.create_heatmap.call_args_list[-1]
+    assert day_level_call.kwargs["start_date"] == "2024-07-16"  # +12h from 14:00 lands the 16th
+    assert day_level_call.kwargs["filter_type"] == 3
+    assert "start_time" not in day_level_call.kwargs
+    assert signal.max_temp_c == 39.2
+
+
+def test_sense_forecast_raises_clear_error_when_no_data_at_hour_or_day_level():
+    client = MagicMock()
+    client.create_heatmap.return_value = {"activity_id": "hm-empty", "result": {"stats_data": {}}}
+    site = _make_site()
+    fixed_now = datetime(2024, 7, 15, 14, 0)
+
+    with pytest.raises(SenseDataUnavailableError, match="No heatmap temperature data available"):
+        sense_forecast(client, site, now=fixed_now)
+
+    assert client.create_heatmap.call_count == 2
+
+
+def test_sense_live_and_sense_forecast_use_an_extended_timeout():
+    """Live-verified (Phase 9): a real environmental_parameters call hit
+    TaskTimeoutError at the client's 60s default -- the same class of
+    slow-async-task issue Phase 7 already fixed for satellite/streetview/
+    heat_intelligence, just not applied to sense.py's own calls yet.
+    """
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(mean_temp_c=35.0, max_temp_c=41.5)
+    client.environmental_parameters.return_value = _env_params_result()
+    site = _make_site()
+
+    sense_live(client, site)
+    sense_forecast(client, site)
+
+    for call in client.create_heatmap.call_args_list:
+        assert call.kwargs.get("timeout") is not None
+        assert call.kwargs["timeout"] >= 300.0
+    env_call = client.environmental_parameters.call_args
+    assert env_call.kwargs.get("timeout") is not None
+    assert env_call.kwargs["timeout"] >= 300.0
+
+
 def test_sense_forecast_beyond_12h_raises_forecast_window_error():
     client = FortyGuardClient(api_key="test-key", base_url="https://api.fortyguard.com")
     site = _make_site()
