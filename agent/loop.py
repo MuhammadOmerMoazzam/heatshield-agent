@@ -162,9 +162,11 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
                 heat_index=forecast_temp_f,
                 aqi=None,
                 # No env_params call for a forecast -- these aren't real
-                # measurements. is_forecast=True is the flag that says so.
-                humidity=0.0,
-                solar_irradiance=0.0,
+                # measurements. NULL (not a 0.0 sentinel, now that the
+                # columns are nullable -- Phase 9) plus is_forecast=True
+                # together say so unambiguously.
+                humidity=None,
+                solar_irradiance=None,
                 is_forecast=True,
                 heatmap_geojson=forecast_signal.heatmap_geojson,
             )

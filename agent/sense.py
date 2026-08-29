@@ -24,17 +24,38 @@ env_params response are time-aligned arrays, not scalars, and missing
 values come back as JSON ``null`` (never to be read as zero) -- both
 handled explicitly here rather than assumed away.
 
-Production evidence (real Streamlit Cloud logs, Phase 9): a
-``create_heatmap`` call for the literal current hour reliably succeeds
-(200 OK) but returns ``stats_data`` with no ``temperature_stats`` --
-FortyGuard's pipeline evidently hasn't ingested/aggregated that hour's
-data yet. Observed 100% of the time across several hours of real
-scheduled cycles, not a one-off flake. ``sense_live`` retries a few
-hours further back (``LIVE_LOOKBACK_HOURS``) before giving up, and uses
-whichever hour actually returns data -- for both the heatmap call and,
-per Rule 2, the matching ``environmental_parameters`` call -- rather
-than the originally-requested "now". The returned ``RawReading.ts``
-honestly reflects which hour the data is actually from.
+Production evidence (real Streamlit Cloud logs, Phase 9, several hours
+of real scheduled cycles): a ``create_heatmap`` call for the literal
+current hour reliably succeeds (200 OK) but returns ``stats_data`` with
+no ``temperature_stats`` -- FortyGuard's pipeline evidently hasn't
+ingested/aggregated that hour's data yet, and this can lag more than a
+couple of hours behind real-time. ``environmental_parameters`` shows the
+exact same "succeeds but empty" behavior, independently, live-verified.
+A day-level ``create_heatmap`` query (``filter_type=3``, "today"), by
+contrast, has reliably had real data every time this was checked live.
+
+Given that, ``sense_live``'s data-gathering is layered, each layer
+falling back only once the one before it comes up genuinely empty:
+
+1. **Temperature** (``create_heatmap``): try a few hours back at hourly
+   precision (``LIVE_LOOKBACK_HOURS`` -- freshest, when available), then
+   fall back to today's day-level aggregate. Only raises
+   ``SenseDataUnavailableError`` if *that* also has no data -- live
+   evidence suggests this should be rare.
+2. **Humidity/solar/AQI** (``environmental_parameters``): tries the same
+   hourly window, against the temperature layer 1 found (Rule 2 --
+   "matching timestamp"). Unlike layer 1, there is no day-level
+   fallback for this endpoint, so if every attempt comes up empty, this
+   layer degrades to ``None`` rather than raising -- a real, current
+   temperature reading is worth keeping even without the humidity/solar
+   penalties ``compute_raw_stress`` (agent/score.py) normally adds, and
+   is a better signal than refusing to produce a reading at all. When
+   this happens, ``RawReading.heat_index`` itself falls back to the
+   heatmap's own ambient temperature (no humidity adjustment available).
+
+The returned ``RawReading.ts`` honestly reflects which hour the
+temperature data is actually from (or "now", for a day-level reading --
+there's no single hour to attribute it to).
 """
 
 from __future__ import annotations
@@ -53,8 +74,11 @@ class RawReading(BaseModel):
     ts: datetime
     heat_index: float  # degrees Fahrenheit (converted from the API's Celsius)
     aqi: float | None
-    humidity: float  # percent
-    solar_irradiance: float  # W/m^2 (clear-sky GHI)
+    # None when environmental_parameters had no data at any attempted
+    # timestamp (live-verified: this happens) -- a real but incomplete
+    # reading, not an error condition.
+    humidity: float | None  # percent
+    solar_irradiance: float | None  # W/m^2 (clear-sky GHI)
     is_forecast: bool = False
     # The heatmap call's own tile FeatureCollection (Phase 8's dashboard
     # map panel) -- None if the response carried no map_data.
@@ -86,31 +110,19 @@ def celsius_to_fahrenheit(celsius: float) -> float:
     return celsius * 9 / 5 + 32
 
 
-def _first_or_raise(values: list | None, field: str) -> float:
-    value = values[0] if values else None
-    if value is None:
-        raise SenseDataUnavailableError(
-            f"env_params returned no data for '{field}' at the requested timestamp."
-        )
-    return value
-
-
-def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = None) -> RawReading:
-    """Sense the current moment: a heatmap call for "now", falling back to
-    a few hours earlier if that hour has no data yet (see module
-    docstring), then env_params against whichever timestamp actually
-    succeeded (Rule 2).
+def _fetch_live_temperature(
+    client: FortyGuardClient, site: Site, base_now: datetime
+) -> tuple[float, datetime, dict | None]:
+    """Layer 1: a few hours back at hourly precision, then today's
+    day-level aggregate. Returns (mean_temp_c, ts, heatmap_geojson).
+    Raises SenseDataUnavailableError only if the day-level fallback also
+    has no data -- see module docstring.
     """
-    base_now = now or _now_naive_utc()
-
-    mean_temp_c = None
-    ts = None
-    heatmap_geojson = None
-    attempted_timestamps: list[datetime] = []
+    attempted: list[str] = []
 
     for hours_back in LIVE_LOOKBACK_HOURS:
         candidate_ts = base_now - timedelta(hours=hours_back)
-        attempted_timestamps.append(candidate_ts)
+        attempted.append(candidate_ts.strftime("%Y-%m-%d %H:%M"))
 
         heatmap_response = client.create_heatmap(
             site.polygon_geojson,
@@ -122,35 +134,84 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
             "temperature_stats"
         )
         if temperature_stats is not None and temperature_stats.get("mean") is not None:
-            mean_temp_c = temperature_stats["mean"]
-            ts = candidate_ts
-            heatmap_geojson = heatmap_response["result"].get("map_data")
-            break
+            return (
+                temperature_stats["mean"],
+                candidate_ts,
+                heatmap_response["result"].get("map_data"),
+            )
 
-    if mean_temp_c is None:
-        attempted_str = ", ".join(t.strftime("%Y-%m-%d %H:%M") for t in attempted_timestamps)
-        raise SenseDataUnavailableError(
-            f"No heatmap temperature data available for site_id={site.id} at any of the last "
-            f"{len(LIVE_LOOKBACK_HOURS)} hourly attempts ({attempted_str}) -- FortyGuard's "
-            "pipeline may not have ingested data for this recently yet."
+    day_response = client.create_heatmap(
+        site.polygon_geojson,
+        start_date=base_now.date().isoformat(),
+        filter_type=3,
+    )
+    day_temperature_stats = day_response.get("result", {}).get("stats_data", {}).get(
+        "temperature_stats"
+    )
+    if day_temperature_stats is not None and day_temperature_stats.get("mean") is not None:
+        return day_temperature_stats["mean"], base_now, day_response["result"].get("map_data")
+
+    attempted_str = ", ".join(attempted)
+    raise SenseDataUnavailableError(
+        f"No heatmap temperature data available for site_id={site.id} at any of the last "
+        f"{len(LIVE_LOOKBACK_HOURS)} hourly attempts ({attempted_str}) or today's day-level "
+        "aggregate -- FortyGuard's pipeline may not have ingested data for this site recently."
+    )
+
+
+def _fetch_live_environmental_parameters(
+    client: FortyGuardClient, site: Site, mean_temp_c: float, ts: datetime
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Layer 2: humidity/solar/AQI. Tries ``ts`` first -- the exact
+    timestamp layer 1's temperature actually came from (Rule 2:
+    "matching timestamp"), not the originally-requested "now" -- then
+    widens further back over the same hourly window if that specific
+    hour has no data yet. No day-level equivalent exists for this
+    endpoint, so this returns all-None (rather than raising) once every
+    attempt is empty -- see module docstring for why that's the right
+    degradation here.
+
+    Returns (heat_index_c, humidity_pct, ghi, aqi), any of which may be
+    None.
+    """
+    for hours_back in LIVE_LOOKBACK_HOURS:
+        candidate_ts = ts - timedelta(hours=hours_back)
+        env_response = client.environmental_parameters(
+            site.lat,
+            site.lon,
+            temperature=mean_temp_c,
+            reference_ts=candidate_ts,
         )
+        location = env_response["result"]["locations"][0]
+        parameters = location["parameters"]
+        heat_index_values = parameters.get("heat_index_celsius") or []
+        if heat_index_values and heat_index_values[0] is not None:
+            humidity_values = parameters.get("relative_humidity_percent") or [None]
+            aqi_values = parameters.get("air_quality:idx") or [None]
+            ghi = location.get("solar_irradiance", {}).get("clear_sky", {}).get("ghi")
+            return heat_index_values[0], humidity_values[0], ghi, aqi_values[0]
 
-    env_response = client.environmental_parameters(
-        site.lat,
-        site.lon,
-        temperature=mean_temp_c,
-        reference_ts=ts,
-    )
-    location = env_response["result"]["locations"][0]
-    parameters = location["parameters"]
+    return None, None, None, None
 
-    heat_index_c = _first_or_raise(parameters.get("heat_index_celsius"), "heat_index_celsius")
-    humidity = _first_or_raise(
-        parameters.get("relative_humidity_percent"), "relative_humidity_percent"
+
+def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = None) -> RawReading:
+    """Sense the current moment via the two-layer fallback chain
+    described in the module docstring.
+    """
+    base_now = now or _now_naive_utc()
+
+    mean_temp_c, ts, heatmap_geojson = _fetch_live_temperature(client, site, base_now)
+    heat_index_c, humidity, ghi, aqi = _fetch_live_environmental_parameters(
+        client, site, mean_temp_c, ts
     )
-    ghi = location["solar_irradiance"]["clear_sky"]["ghi"]
-    aqi_values = parameters.get("air_quality:idx") or [None]
-    aqi = aqi_values[0]
+
+    if heat_index_c is None:
+        # No humidity/solar signal at any attempted hour -- the ambient
+        # temperature this cycle's own heatmap call already measured is
+        # still a real, current reading, just without the small
+        # humidity/solar stress adjustments compute_raw_stress normally
+        # adds.
+        heat_index_c = mean_temp_c
 
     return RawReading(
         site_id=site.id,

@@ -82,6 +82,29 @@ def _env_params_result(
     }
 
 
+def _env_params_result_empty(ghi: float = 0.0) -> dict:
+    """Matches live-observed behavior: env_params returns 200 OK with
+    empty parameter arrays (not a 4xx/5xx) when it has no data yet for
+    the requested timestamp -- the same "succeeds but empty" shape as
+    create_heatmap's own current-hour data lag.
+    """
+    return {
+        "activity_id": "env-empty",
+        "result": {
+            "locations": [
+                {
+                    "parameters": {
+                        "heat_index_celsius": [],
+                        "relative_humidity_percent": [],
+                        "air_quality:idx": [],
+                    },
+                    "solar_irradiance": {"clear_sky": {"ghi": ghi}},
+                }
+            ]
+        },
+    }
+
+
 def test_sense_live_calls_both_endpoints_with_matching_timestamps():
     client = MagicMock()
     client.create_heatmap.return_value = _heatmap_result(mean_temp_c=35.0)
@@ -144,12 +167,45 @@ def test_sense_live_falls_back_to_an_earlier_hour_when_now_has_no_data():
     assert reading.ts == datetime(2024, 7, 15, 13, 0)
 
 
+def test_sense_live_falls_back_to_day_level_heatmap_when_all_hourly_attempts_empty():
+    """Production evidence (Phase 9, live-verified): both create_heatmap's
+    hourly data AND environmental_parameters can lag more than
+    LIVE_LOOKBACK_HOURS behind real-time, but create_heatmap's day-level
+    aggregate (filter_type=3, "today") reliably has real data even then.
+    Once every hourly attempt comes back empty, sense_live falls back to
+    it rather than giving up.
+    """
+    client = MagicMock()
+    empty_result = {"activity_id": "hm-empty", "result": {"stats_data": {}}}
+    day_level_result = _heatmap_result(mean_temp_c=36.8)
+    client.create_heatmap.side_effect = [empty_result, empty_result, empty_result, day_level_result]
+    client.environmental_parameters.return_value = _env_params_result()
+    site = _make_site()
+    fixed_now = datetime(2024, 7, 15, 14, 0)
+
+    reading = sense_live(client, site, now=fixed_now)
+
+    assert client.create_heatmap.call_count == len(LIVE_LOOKBACK_HOURS) + 1
+    day_level_call = client.create_heatmap.call_args_list[-1]
+    assert day_level_call.kwargs["start_date"] == "2024-07-15"
+    assert day_level_call.kwargs["filter_type"] == 3
+    assert "start_time" not in day_level_call.kwargs
+
+    # No single hour to honestly attribute a day-aggregate reading to --
+    # the reading is generated now, using today's best-available data.
+    assert reading.ts == fixed_now
+    env_call = client.environmental_parameters.call_args
+    assert env_call.kwargs["reference_ts"] == fixed_now
+    assert env_call.kwargs["temperature"] == 36.8
+
+
 def test_sense_live_raises_clear_error_when_no_data_at_any_fallback_hour():
-    """The loud-failure case: every configured fallback hour comes back
-    with no usable data. This must be an unambiguous, diagnosable error
-    (not the raw KeyError this used to surface as) -- caught and logged
-    by agent.loop's existing per-site resilience layer same as before,
-    but now with a message an operator can actually act on.
+    """The loud-failure case: every hourly attempt AND the day-level
+    fallback come back with no usable data. This must be an unambiguous,
+    diagnosable error (not the raw KeyError this used to surface as) --
+    caught and logged by agent.loop's existing per-site resilience layer
+    same as before, but now with a message an operator can actually act
+    on.
     """
     client = MagicMock()
     client.create_heatmap.return_value = {"activity_id": "hm-empty", "result": {"stats_data": {}}}
@@ -159,9 +215,35 @@ def test_sense_live_raises_clear_error_when_no_data_at_any_fallback_hour():
     with pytest.raises(SenseDataUnavailableError, match="No heatmap temperature data available"):
         sense_live(client, site, now=fixed_now)
 
-    # Tried every configured fallback hour, not just the first, before
-    # giving up.
-    assert client.create_heatmap.call_count == len(LIVE_LOOKBACK_HOURS)
+    # Tried every configured hourly fallback plus the day-level one, not
+    # just the first, before giving up.
+    assert client.create_heatmap.call_count == len(LIVE_LOOKBACK_HOURS) + 1
+
+
+def test_sense_live_falls_back_to_ambient_temperature_when_env_params_has_no_data():
+    """Production evidence (Phase 9, live-verified): environmental_parameters
+    can independently lag the same way create_heatmap's hourly data does
+    -- confirmed live returning empty heat_index_celsius/
+    relative_humidity_percent arrays at "now". Rather than discard an
+    otherwise-real temperature reading, sense_live falls back to the
+    heatmap's own ambient temperature as the heat index, and reports
+    humidity/solar_irradiance as genuinely unavailable (None) instead of
+    guessing -- compute_raw_stress is designed to handle that (see
+    agent/score.py).
+    """
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(mean_temp_c=30.0)
+    client.environmental_parameters.return_value = _env_params_result_empty()
+    site = _make_site()
+    fixed_now = datetime(2024, 7, 15, 14, 0)
+
+    reading = sense_live(client, site, now=fixed_now)
+
+    assert client.environmental_parameters.call_count == len(LIVE_LOOKBACK_HOURS)
+    assert reading.heat_index == pytest.approx(30.0 * 9 / 5 + 32)
+    assert reading.humidity is None
+    assert reading.solar_irradiance is None
+    assert reading.aqi is None
 
 
 def test_sense_live_captures_heatmap_tile_geojson_for_dashboard():

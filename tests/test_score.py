@@ -34,6 +34,20 @@ def test_raw_stress_increases_with_solar_irradiance():
     assert high > low
 
 
+def test_raw_stress_handles_missing_humidity_and_solar_gracefully():
+    """Live-verified (Phase 9): environmental_parameters can independently
+    have no data for a given cycle -- sense_live then reports humidity/
+    solar_irradiance as None rather than guessing. compute_raw_stress must
+    not crash on that; a None signal simply contributes no penalty for
+    that factor, same as a measured value at/under its own no-penalty
+    threshold, rather than blocking the score entirely.
+    """
+    baseline = compute_raw_stress(heat_index_f=95.0, humidity_pct=30.0, solar_irradiance=0.0)
+    missing_both = compute_raw_stress(heat_index_f=95.0, humidity_pct=None, solar_irradiance=None)
+
+    assert missing_both == baseline == 95.0
+
+
 def test_exposure_modifier_reduces_score_with_higher_shade_coverage():
     no_shade = compute_exposure_modifier(shade_coverage_pct=0.0, work_intensity="moderate")
     full_shade = compute_exposure_modifier(shade_coverage_pct=90.0, work_intensity="moderate")

@@ -89,8 +89,12 @@ class Reading(Base):
     ts = Column(DateTime, nullable=False)
     heat_index = Column(Float, nullable=False)
     aqi = Column(Float, nullable=True)
-    humidity = Column(Float, nullable=False)
-    solar_irradiance = Column(Float, nullable=False)
+    # Nullable: environmental_parameters can independently have no data
+    # at any of sense_live's attempted timestamps (live-verified, Phase
+    # 9) -- NULL means "genuinely unknown this cycle", distinguishable
+    # from a real measured 0.
+    humidity = Column(Float, nullable=True)
+    solar_irradiance = Column(Float, nullable=True)
     # Distinguishes the live reactive branch from the +12h forecast branch
     # (Part B.2) -- Phase 5/6 branch directly on this column.
     is_forecast = Column(Boolean, nullable=False, default=False)

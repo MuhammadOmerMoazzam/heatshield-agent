@@ -81,12 +81,22 @@ CAUTION_MAX_F = 103.0
 HIGH_MAX_F = 125.0
 
 
-def compute_raw_stress(heat_index_f: float, humidity_pct: float, solar_irradiance: float) -> float:
-    """Heat index (°F) plus a humidity penalty above 40% and a solar-loading penalty."""
+def compute_raw_stress(
+    heat_index_f: float, humidity_pct: float | None, solar_irradiance: float | None
+) -> float:
+    """Heat index (°F) plus a humidity penalty above 40% and a solar-loading penalty.
+
+    ``humidity_pct``/``solar_irradiance`` of ``None`` (live-verified,
+    Phase 9: environmental_parameters can independently have no data for
+    a given cycle) contributes no penalty for that factor, the same as a
+    measured value at/under its own no-penalty threshold -- a real heat
+    index is still worth scoring even without the small additive
+    adjustments these two normally contribute.
+    """
     stress = heat_index_f
-    if humidity_pct > HUMIDITY_THRESHOLD_PCT:
+    if humidity_pct is not None and humidity_pct > HUMIDITY_THRESHOLD_PCT:
         stress += (humidity_pct - HUMIDITY_THRESHOLD_PCT) * HUMIDITY_STRESS_PER_PCT
-    if solar_irradiance > 0:
+    if solar_irradiance is not None and solar_irradiance > 0:
         stress += solar_irradiance * SOLAR_STRESS_PER_WM2
     return stress
 

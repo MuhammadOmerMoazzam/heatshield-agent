@@ -144,6 +144,43 @@ def test_dashboard_media_fields_round_trip(tmp_path):
         assert reading.heatmap_geojson == geojson
 
 
+def test_reading_humidity_and_solar_irradiance_are_nullable(tmp_path):
+    """Live-verified (Phase 9): environmental_parameters can independently
+    have no data at any attempted timestamp -- sense_live's fallback then
+    returns a real temperature-based reading with humidity/solar_irradiance
+    genuinely unknown for this cycle, not a guessed 0.0. NULL must be a
+    valid, persistable state for both columns, distinguishable from a
+    real measured 0.
+    """
+    database_url = f"sqlite:///{tmp_path / 'nullable.db'}"
+
+    with db_session(database_url) as session:
+        site = Site(
+            name="Nullable Test Site",
+            lat=37.33,
+            lon=-121.90,
+            polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+        )
+        session.add(site)
+        session.flush()
+
+        reading = Reading(
+            site_id=site.id,
+            ts=datetime(2026, 8, 3, 14, 0),
+            heat_index=95.0,
+            aqi=None,
+            humidity=None,
+            solar_irradiance=None,
+            is_forecast=False,
+        )
+        session.add(reading)
+
+    with db_session(database_url) as session:
+        reading = session.query(Reading).one()
+        assert reading.humidity is None
+        assert reading.solar_irradiance is None
+
+
 def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):
     """Regression test: concurrent first-time db_session() calls against the
     same not-yet-cached URL used to race on Base.metadata.create_all(),
