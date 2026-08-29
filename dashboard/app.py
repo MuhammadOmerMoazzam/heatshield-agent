@@ -30,8 +30,23 @@ needed ("once per process," not "once per session").
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from pathlib import Path
+
+# Streamlit Cloud's launcher does not put this repo's root on sys.path
+# the way a plain local `streamlit run` invocation does -- confirmed live:
+# this module deployed with "ModuleNotFoundError: No module named 'agent'"
+# even though the exact same clone/install/run sequence worked locally.
+# agent/ and dashboard/ are source directories here, never actually
+# `pip install`-ed as packages (Cloud's build step only runs
+# `pip install -r requirements.txt`, never `pip install .`), so their
+# importability depends entirely on sys.path -- computed here from
+# __file__ rather than relied on implicitly, so it's correct no matter
+# what CWD or launch mechanism actually runs this script.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import streamlit as st
 
