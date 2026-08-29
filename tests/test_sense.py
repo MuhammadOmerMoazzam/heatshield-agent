@@ -48,13 +48,15 @@ def _make_site(site_id: int = 1) -> Site:
     return site
 
 
-def _heatmap_result(mean_temp_c: float = 35.0, max_temp_c: float = 40.0) -> dict:
-    return {
-        "activity_id": "hm-1",
-        "result": {
-            "stats_data": {"temperature_stats": {"mean": mean_temp_c, "maximum": max_temp_c}}
-        },
+def _heatmap_result(
+    mean_temp_c: float = 35.0, max_temp_c: float = 40.0, map_data: dict | None = None
+) -> dict:
+    result = {
+        "stats_data": {"temperature_stats": {"mean": mean_temp_c, "maximum": max_temp_c}}
     }
+    if map_data is not None:
+        result["map_data"] = map_data
+    return {"activity_id": "hm-1", "result": result}
 
 
 def _env_params_result(
@@ -108,6 +110,33 @@ def test_sense_live_calls_both_endpoints_with_matching_timestamps():
     assert reading.heat_index == pytest.approx(38.0 * 9 / 5 + 32)
 
 
+def test_sense_live_captures_heatmap_tile_geojson_for_dashboard():
+    """Phase 8: the dashboard's map panel renders the tile FeatureCollection
+    a heatmap call already returns -- it must not be discarded after the
+    mean/max stats are pulled out of it.
+    """
+    map_data = {"type": "FeatureCollection", "features": [{"properties": {"temperature": 35.0}}]}
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(map_data=map_data)
+    client.environmental_parameters.return_value = _env_params_result()
+    site = _make_site()
+
+    reading = sense_live(client, site)
+
+    assert reading.heatmap_geojson == map_data
+
+
+def test_sense_live_heatmap_geojson_defaults_to_none_when_absent():
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result()  # no map_data
+    client.environmental_parameters.return_value = _env_params_result()
+    site = _make_site()
+
+    reading = sense_live(client, site)
+
+    assert reading.heatmap_geojson is None
+
+
 def test_sense_forecast_calls_only_heatmap():
     client = MagicMock()
     client.create_heatmap.return_value = _heatmap_result(max_temp_c=41.5)
@@ -119,6 +148,17 @@ def test_sense_forecast_calls_only_heatmap():
     assert client.environmental_parameters.call_count == 0
     assert signal.site_id == 1
     assert signal.max_temp_c == 41.5
+
+
+def test_sense_forecast_captures_heatmap_tile_geojson_for_dashboard():
+    map_data = {"type": "FeatureCollection", "features": [{"properties": {"temperature": 41.5}}]}
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(max_temp_c=41.5, map_data=map_data)
+    site = _make_site()
+
+    signal = sense_forecast(client, site)
+
+    assert signal.heatmap_geojson == map_data
 
 
 def test_sense_forecast_beyond_12h_raises_forecast_window_error():

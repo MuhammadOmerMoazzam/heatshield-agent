@@ -60,7 +60,11 @@ def _heatmap_result(mean_temp_c: float = 25.0, max_temp_c: float = 27.0) -> dict
     return {
         "activity_id": "hm",
         "result": {
-            "stats_data": {"temperature_stats": {"mean": mean_temp_c, "maximum": max_temp_c}}
+            "stats_data": {"temperature_stats": {"mean": mean_temp_c, "maximum": max_temp_c}},
+            "map_data": {
+                "type": "FeatureCollection",
+                "features": [{"properties": {"temperature": mean_temp_c}}],
+            },
         },
     }
 
@@ -157,6 +161,13 @@ def test_full_cycle_safe_reading_produces_no_side_effects(tmp_path, mocker):
         assert len(decisions) == 2  # one live + one forecast, both crew-scored
         for decision in decisions:
             assert decision.action_taken == "none"
+
+        # Phase 8: the dashboard's map panel reads this straight off the
+        # reading row -- the loop must persist it, not just sense.py return it.
+        readings = session.query(Reading).all()
+        assert len(readings) == 2
+        for reading in readings:
+            assert reading.heatmap_geojson["features"][0]["properties"]["temperature"] == 25.0
 
     notify_mock.assert_not_called()
     schedule_mock.assert_not_called()

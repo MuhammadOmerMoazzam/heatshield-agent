@@ -20,3 +20,8 @@ dist/
 # WAL/SHM/journal sidecars (e.g. heatshield.db-wal)
 data/*.db*
 data/*.sqlite3*
+
+# Downloaded/generated artifacts (compliance report PDFs, onboarding
+# segmentation images) -- keep the directory, ignore its contents.
+outputs/*
+!outputs/.gitkeep

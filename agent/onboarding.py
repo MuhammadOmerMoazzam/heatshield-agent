@@ -24,12 +24,23 @@ streetview are Premium, credit-metered endpoints and a site's physical
 shade doesn't change hour to hour -- there's no reason to re-spend
 credits on every cycle (Phase 7's loop calls this once per site, not
 once per sense cycle).
+
+Phase 8: both segmentation responses also carry a base64 overlay image
+(``segmentation.image_content`` for satellite, ``front.segmented_image``
+for street-view) plus an ``image_legend`` ({class_name: hex_color}) --
+these are decoded and saved to ``outputs/`` (mirroring
+``FortyGuardClient.heat_intelligence``'s own PDF-to-disk convention)
+rather than discarded after the percentages are derived, so the
+dashboard has something to render.
 """
 
 from __future__ import annotations
 
+import base64
 from datetime import date
+from pathlib import Path
 
+from agent._shared import REPO_ROOT
 from agent.fortyguard_client import FortyGuardClient
 from agent.models import Site
 
@@ -54,6 +65,22 @@ def _derive_canopy_pct(satellite_result: dict) -> float:
 def _derive_shade_coverage_pct(streetview_result: dict) -> float:
     segments = streetview_result.get("front", {}).get("segments", {})
     return _sum_matching_segments(segments, _SHADE_KEYWORDS)
+
+
+def _decode_and_save_image(b64_data, out_path: Path) -> Path | None:
+    """Decode a base64 image (or the first of a list of them) and write it
+    to ``out_path``. Returns ``None`` without writing anything if the API
+    response carried no image -- not every plan/response includes one.
+    """
+    if isinstance(b64_data, list):
+        b64_data = b64_data[0] if b64_data else None
+    if not b64_data:
+        return None
+    if b64_data.startswith("data:"):
+        b64_data = b64_data.split(",", 1)[1]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(base64.b64decode(b64_data))
+    return out_path
 
 
 def onboard_site(
@@ -99,4 +126,23 @@ def onboard_site(
 
     site.canopy_pct = _derive_canopy_pct(satellite_response["result"])
     site.shade_coverage_pct = _derive_shade_coverage_pct(streetview_response["result"])
+
+    satellite_segmentation = satellite_response["result"].get("segmentation", {})
+    satellite_activity_id = satellite_response.get("activity_id", "unknown")
+    satellite_image = _decode_and_save_image(
+        satellite_segmentation.get("image_content"),
+        REPO_ROOT / "outputs" / f"satellite_{satellite_activity_id}.png",
+    )
+    site.satellite_image_path = str(satellite_image) if satellite_image else None
+    site.satellite_legend = satellite_segmentation.get("image_legend") or None
+
+    streetview_front = streetview_response["result"].get("front", {})
+    streetview_activity_id = streetview_response.get("activity_id", "unknown")
+    streetview_image = _decode_and_save_image(
+        streetview_front.get("segmented_image"),
+        REPO_ROOT / "outputs" / f"streetview_{streetview_activity_id}.png",
+    )
+    site.streetview_image_path = str(streetview_image) if streetview_image else None
+    site.streetview_legend = streetview_front.get("image_legend") or None
+
     return site

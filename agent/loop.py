@@ -111,6 +111,7 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
         humidity=raw_reading.humidity,
         solar_irradiance=raw_reading.solar_irradiance,
         is_forecast=False,
+        heatmap_geojson=raw_reading.heatmap_geojson,
     )
     session.add(reading)
     session.flush()
@@ -144,6 +145,7 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
         humidity=0.0,
         solar_irradiance=0.0,
         is_forecast=True,
+        heatmap_geojson=forecast_signal.heatmap_geojson,
     )
     session.add(forecast_reading)
     session.flush()

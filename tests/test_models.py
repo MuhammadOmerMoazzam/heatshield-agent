@@ -98,6 +98,52 @@ def test_create_and_read_one_row_per_table(tmp_path):
         assert decisions[0].report_url is None
 
 
+def test_dashboard_media_fields_round_trip(tmp_path):
+    """Phase 8 schema extension: sites carry onboarding segmentation image
+    paths + legends, readings carry the heatmap tile GeoJSON -- both
+    nullable, both needed for the dashboard's image/map panels.
+    """
+    database_url = f"sqlite:///{tmp_path / 'media.db'}"
+    geojson = {"type": "FeatureCollection", "features": [{"properties": {"temperature": 35.0}}]}
+    legend = {"tree": "#2e7d32", "building": "#616161"}
+
+    with db_session(database_url) as session:
+        site = Site(
+            name="Media Test Site",
+            lat=37.33,
+            lon=-121.90,
+            polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+            satellite_image_path="outputs/satellite_abc.png",
+            satellite_legend=legend,
+            streetview_image_path=None,
+            streetview_legend=None,
+        )
+        session.add(site)
+        session.flush()
+
+        reading = Reading(
+            site_id=site.id,
+            ts=datetime(2026, 8, 3, 14, 0),
+            heat_index=41.2,
+            aqi=None,
+            humidity=38.0,
+            solar_irradiance=810.0,
+            is_forecast=False,
+            heatmap_geojson=geojson,
+        )
+        session.add(reading)
+
+    with db_session(database_url) as session:
+        site = session.query(Site).one()
+        reading = session.query(Reading).one()
+
+        assert site.satellite_image_path == "outputs/satellite_abc.png"
+        assert site.satellite_legend == legend
+        assert site.streetview_image_path is None
+        assert site.streetview_legend is None
+        assert reading.heatmap_geojson == geojson
+
+
 def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):
     """Regression test: concurrent first-time db_session() calls against the
     same not-yet-cached URL used to race on Base.metadata.create_all(),

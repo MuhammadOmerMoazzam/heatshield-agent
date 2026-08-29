@@ -59,6 +59,15 @@ class Site(Base):
     shade_coverage_pct = Column(Float, nullable=True)
     canopy_pct = Column(Float, nullable=True)
     created_at = Column(DateTime, nullable=False, default=now_naive_utc)
+    # Populated by onboarding (Phase 4/8): decoded, saved-to-disk
+    # segmentation overlays + their {class_name: hex_color} legends, for
+    # the dashboard's segmentation panels (Phase 8). Nullable like
+    # shade_coverage_pct/canopy_pct -- a site onboarded before satellite/
+    # streetview finish, or that returned no image, has none of these yet.
+    satellite_image_path = Column(String, nullable=True)
+    satellite_legend = Column(JSON, nullable=True)
+    streetview_image_path = Column(String, nullable=True)
+    streetview_legend = Column(JSON, nullable=True)
 
 
 class Crew(Base):
@@ -85,6 +94,10 @@ class Reading(Base):
     # Distinguishes the live reactive branch from the +12h forecast branch
     # (Part B.2) -- Phase 5/6 branch directly on this column.
     is_forecast = Column(Boolean, nullable=False, default=False)
+    # The heatmap call's own tile FeatureCollection (Phase 8's dashboard map
+    # panel) -- nullable since older readings predate this column and a
+    # mocked/degraded heatmap response may carry no map_data.
+    heatmap_geojson = Column(JSON, nullable=True)
 
 
 class Score(Base):

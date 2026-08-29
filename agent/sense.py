@@ -44,12 +44,16 @@ class RawReading(BaseModel):
     humidity: float  # percent
     solar_irradiance: float  # W/m^2 (clear-sky GHI)
     is_forecast: bool = False
+    # The heatmap call's own tile FeatureCollection (Phase 8's dashboard
+    # map panel) -- None if the response carried no map_data.
+    heatmap_geojson: dict | None = None
 
 
 class ForecastSignal(BaseModel):
     site_id: int
     ts: datetime
     max_temp_c: float
+    heatmap_geojson: dict | None = None
 
 
 class SenseDataUnavailableError(Exception):
@@ -84,6 +88,7 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
         filter_type=1,
     )
     mean_temp_c = heatmap_response["result"]["stats_data"]["temperature_stats"]["mean"]
+    heatmap_geojson = heatmap_response["result"].get("map_data")
 
     env_response = client.environmental_parameters(
         site.lat,
@@ -110,6 +115,7 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
         humidity=humidity,
         solar_irradiance=ghi,
         is_forecast=False,
+        heatmap_geojson=heatmap_geojson,
     )
 
 
@@ -128,5 +134,8 @@ def sense_forecast(
         filter_type=1,
     )
     max_temp_c = heatmap_response["result"]["stats_data"]["temperature_stats"]["maximum"]
+    heatmap_geojson = heatmap_response["result"].get("map_data")
 
-    return ForecastSignal(site_id=site.id, ts=ts, max_temp_c=max_temp_c)
+    return ForecastSignal(
+        site_id=site.id, ts=ts, max_temp_c=max_temp_c, heatmap_geojson=heatmap_geojson
+    )
