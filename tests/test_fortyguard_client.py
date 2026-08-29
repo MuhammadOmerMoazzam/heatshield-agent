@@ -256,3 +256,35 @@ def test_us_only_coordinate_guard(respx_mock, client):
         )
 
     assert len(respx_mock.calls) == 0
+
+
+def test_heat_intelligence_downloads_report_pdf(respx_mock, client, mocker, tmp_path):
+    mocker.patch("agent.fortyguard_client.time.sleep")
+    activity_id = "hi-1"
+    download_url = "https://storage.example.com/signed/report.pdf"
+    pdf_bytes = b"%PDF-1.4 fake report content"
+
+    respx_mock.post(f"{BASE_URL}/v1/heat_intelligence").mock(
+        return_value=httpx.Response(200, json=_envelope({"activity_id": activity_id}))
+    )
+    respx_mock.get(f"{BASE_URL}/v1/status/{activity_id}").mock(
+        return_value=httpx.Response(
+            200,
+            json=_envelope(
+                {
+                    "activity_id": activity_id,
+                    "status": "Completed",
+                    "result": {"download_link": download_url},
+                }
+            ),
+        )
+    )
+    respx_mock.get(download_url).mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    output_path = tmp_path / "report.pdf"
+    result_path = client.heat_intelligence(
+        *PHOENIX, temperature=104.0, date="2024-07-15", output_path=output_path
+    )
+
+    assert result_path == output_path
+    assert output_path.read_bytes() == pdf_bytes

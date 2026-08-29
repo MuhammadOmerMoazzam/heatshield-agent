@@ -18,6 +18,7 @@ import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterable
 
 import httpx
@@ -423,13 +424,22 @@ class FortyGuardClient:
         temperature: float,
         date: str,
         analysis: Iterable[str] = ("environmental",),
+        output_path: str | Path | None = None,
         *,
         timeout: float | None = None,
-    ) -> dict:
+    ) -> Path:
         """POST /v1/heat_intelligence -- generate a heat-intelligence report.
 
         Note the underscore in the path (Rule 1) -- there is no
-        ``/v1/heat-intelligence`` (dash) endpoint.
+        ``/v1/heat-intelligence`` (dash) endpoint. ``temperature`` is in
+        **Fahrenheit** here -- unlike ``environmental_parameters``, which
+        takes Celsius -- confirmed against the live docs.
+
+        The completed status response carries a short-lived signed
+        ``result.download_link``, not the PDF itself. Per the docs' own
+        guidance ("use it immediately... do not log or share the full
+        signed URL"), this downloads the PDF right away and returns the
+        local file path rather than the URL.
         """
         _validate_us_coordinate(latitude, longitude)
 
@@ -440,7 +450,24 @@ class FortyGuardClient:
             "date": date,
             "analysis": list(analysis),
         }
-        return self._submit_and_wait("/v1/heat_intelligence", payload, timeout=timeout)
+        activity_id = self._submit("/v1/heat_intelligence", payload)
+        result = self.wait_for(activity_id)
+        download_link = result.get("download_link")
+        if not download_link:
+            raise FortyGuardError(
+                f"Activity {activity_id} completed but the status response "
+                f"contained no download_link"
+            )
+
+        target = Path(output_path) if output_path else Path("outputs") / f"heat_intelligence_{activity_id}.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with httpx.stream("GET", download_link, timeout=self.timeout) as resp:
+            if resp.status_code >= 400:
+                raise FortyGuardError(f"Downloading report -> {resp.status_code}")
+            with target.open("wb") as fh:
+                for chunk in resp.iter_bytes():
+                    fh.write(chunk)
+        return target
 
     # ------------------------------------------------------------- credits
 
