@@ -23,6 +23,7 @@ from sqlalchemy import (
     String,
     Time,
     create_engine,
+    event,
 )
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -131,6 +132,26 @@ def _resolve_database_url() -> str:
     return os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 
+def _configure_sqlite_for_concurrent_access(engine) -> None:
+    """Real production bug: 'sqlite3.OperationalError: database is
+    locked' crashed the deployed app -- the background scheduler's
+    run_cycle() holds a write transaction open across many sequential,
+    slow API calls, and the dashboard's own per-Streamlit-rerun queries
+    collided with it on the same SQLite file. SQLite's default
+    rollback-journal mode only allows one writer OR reader at a time.
+    WAL mode allows concurrent readers alongside a writer; busy_timeout
+    makes a connection retry for a while before raising, rather than
+    failing immediately on the first collision.
+    """
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
+
 def _get_session_factory(database_url: str) -> sessionmaker:
     # Fast path: no lock needed once a URL is cached. Double-checked
     # locking on the slow path -- without it, concurrent first-time calls
@@ -147,6 +168,8 @@ def _get_session_factory(database_url: str) -> sessionmaker:
                 if parent:
                     os.makedirs(parent, exist_ok=True)
             engine = create_engine(database_url)
+            if url_obj.get_backend_name() == "sqlite":
+                _configure_sqlite_for_concurrent_access(engine)
             Base.metadata.create_all(engine)
             # expire_on_commit=False: db_session() closes its session
             # immediately after commit (see below), and callers like

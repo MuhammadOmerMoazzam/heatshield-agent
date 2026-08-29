@@ -7,6 +7,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
 
+from sqlalchemy import text
+
 from agent.models import Crew, Decision, Reading, Score, Site, db_session
 
 
@@ -179,6 +181,27 @@ def test_reading_humidity_and_solar_irradiance_are_nullable(tmp_path):
         reading = session.query(Reading).one()
         assert reading.humidity is None
         assert reading.solar_irradiance is None
+
+
+def test_sqlite_engine_uses_wal_mode_and_a_busy_timeout(tmp_path):
+    """Regression: a real sqlite3.OperationalError: database is locked
+    crashed the deployed app -- the background scheduler's long-running
+    writes (many sequential API calls per cycle, holding a transaction
+    open the whole time) and the dashboard's own per-rerun queries were
+    colliding on the same SQLite file. The default rollback-journal mode
+    only allows one writer OR reader at a time; WAL mode allows
+    concurrent readers alongside a writer, and a busy_timeout makes a
+    connection retry for a while before raising instead of failing
+    immediately on the first collision.
+    """
+    database_url = f"sqlite:///{tmp_path / 'wal.db'}"
+
+    with db_session(database_url) as session:
+        journal_mode = session.execute(text("PRAGMA journal_mode")).scalar()
+        busy_timeout_ms = session.execute(text("PRAGMA busy_timeout")).scalar()
+
+    assert journal_mode.lower() == "wal"
+    assert busy_timeout_ms >= 10_000
 
 
 def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):
