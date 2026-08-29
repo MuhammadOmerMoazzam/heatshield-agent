@@ -52,6 +52,7 @@ import streamlit as st
 
 from agent.loop import run_scheduler
 from agent.models import Decision, Reading, Score, Site, db_session
+from agent.seed import seed_demo_sites_if_empty
 
 _bootstrap_lock = threading.Lock()
 _scheduler_started = False
@@ -322,6 +323,14 @@ def render_decision_log(decisions: list[dict]) -> None:
 def main() -> None:
     _load_secrets_into_environ()
     st.set_page_config(page_title="HeatShield Agent", layout="wide")
+
+    # Before starting the scheduler: a fresh deployment's container
+    # filesystem starts empty, so without this the very first cycle
+    # would have zero sites to act on. Idempotent -- a no-op after the
+    # first successful call.
+    with db_session() as session:
+        seed_demo_sites_if_empty(session)
+
     bootstrap_agent_loop()
     st.title("HeatShield Agent — Site Risk Dashboard")
 
