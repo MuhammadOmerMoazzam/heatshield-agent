@@ -14,7 +14,7 @@ import pytest
 
 from agent.fortyguard_client import ForecastWindowError, FortyGuardClient
 from agent.models import Site
-from agent.sense import sense_forecast, sense_live
+from agent.sense import LIVE_LOOKBACK_HOURS, SenseDataUnavailableError, sense_forecast, sense_live
 
 SMALL_POLYGON = {
     "type": "FeatureCollection",
@@ -108,6 +108,60 @@ def test_sense_live_calls_both_endpoints_with_matching_timestamps():
     assert reading.aqi == 42.0
     # heat_index_celsius=38.0 -> Fahrenheit
     assert reading.heat_index == pytest.approx(38.0 * 9 / 5 + 32)
+
+
+def test_sense_live_falls_back_to_an_earlier_hour_when_now_has_no_data():
+    """Production evidence (Phase 9, real Streamlit Cloud logs across
+    multiple hours of live cycles): create_heatmap succeeds (200 OK) for
+    the literal current hour, but stats_data carries no temperature_stats
+    -- FortyGuard's pipeline evidently hasn't ingested/aggregated that
+    hour's data yet, 100% of the time observed. sense_live must retry a
+    few hours back rather than treat the very first empty response as
+    fatal.
+    """
+    client = MagicMock()
+    empty_result = {"activity_id": "hm-empty", "result": {"stats_data": {}}}
+    success_result = _heatmap_result(mean_temp_c=30.0)
+    client.create_heatmap.side_effect = [empty_result, success_result]
+    client.environmental_parameters.return_value = _env_params_result()
+    site = _make_site()
+    fixed_now = datetime(2024, 7, 15, 14, 0)
+
+    reading = sense_live(client, site, now=fixed_now)
+
+    assert client.create_heatmap.call_count == 2
+    first_call, second_call = client.create_heatmap.call_args_list
+    assert first_call.kwargs["start_date"] == "2024-07-15"
+    assert first_call.kwargs["start_time"] == "14:00"
+    assert second_call.kwargs["start_date"] == "2024-07-15"
+    assert second_call.kwargs["start_time"] == "13:00"  # one hour back
+
+    # Rule 2: env_params must be called against the timestamp that
+    # actually succeeded, not the originally-requested "now" -- and the
+    # returned reading must honestly report which hour its data is from.
+    env_call = client.environmental_parameters.call_args
+    assert env_call.kwargs["reference_ts"] == datetime(2024, 7, 15, 13, 0)
+    assert reading.ts == datetime(2024, 7, 15, 13, 0)
+
+
+def test_sense_live_raises_clear_error_when_no_data_at_any_fallback_hour():
+    """The loud-failure case: every configured fallback hour comes back
+    with no usable data. This must be an unambiguous, diagnosable error
+    (not the raw KeyError this used to surface as) -- caught and logged
+    by agent.loop's existing per-site resilience layer same as before,
+    but now with a message an operator can actually act on.
+    """
+    client = MagicMock()
+    client.create_heatmap.return_value = {"activity_id": "hm-empty", "result": {"stats_data": {}}}
+    site = _make_site()
+    fixed_now = datetime(2024, 7, 15, 14, 0)
+
+    with pytest.raises(SenseDataUnavailableError, match="No heatmap temperature data available"):
+        sense_live(client, site, now=fixed_now)
+
+    # Tried every configured fallback hour, not just the first, before
+    # giving up.
+    assert client.create_heatmap.call_count == len(LIVE_LOOKBACK_HOURS)
 
 
 def test_sense_live_captures_heatmap_tile_geojson_for_dashboard():

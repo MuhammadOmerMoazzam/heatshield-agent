@@ -23,6 +23,18 @@ for that input, rather than guessing a value. Per-parameter values in the
 env_params response are time-aligned arrays, not scalars, and missing
 values come back as JSON ``null`` (never to be read as zero) -- both
 handled explicitly here rather than assumed away.
+
+Production evidence (real Streamlit Cloud logs, Phase 9): a
+``create_heatmap`` call for the literal current hour reliably succeeds
+(200 OK) but returns ``stats_data`` with no ``temperature_stats`` --
+FortyGuard's pipeline evidently hasn't ingested/aggregated that hour's
+data yet. Observed 100% of the time across several hours of real
+scheduled cycles, not a one-off flake. ``sense_live`` retries a few
+hours further back (``LIVE_LOOKBACK_HOURS``) before giving up, and uses
+whichever hour actually returns data -- for both the heatmap call and,
+per Rule 2, the matching ``environmental_parameters`` call -- rather
+than the originally-requested "now". The returned ``RawReading.ts``
+honestly reflects which hour the data is actually from.
 """
 
 from __future__ import annotations
@@ -57,7 +69,17 @@ class ForecastSignal(BaseModel):
 
 
 class SenseDataUnavailableError(Exception):
-    """A required environmental parameter came back null from the API."""
+    """A required environmental parameter came back null from the API, or
+    no heatmap temperature data was available at any fallback hour tried.
+    """
+
+
+# How many hours back sense_live retries before giving up (0 = the
+# literal current hour, tried first). Each entry is a separate,
+# credit-metered create_heatmap call, so this stays small and bounded --
+# not an unbounded/open-ended search -- rather than a blanket "keep
+# retrying forever" policy.
+LIVE_LOOKBACK_HOURS: tuple[int, ...] = (0, 1, 2)
 
 
 def celsius_to_fahrenheit(celsius: float) -> float:
@@ -74,21 +96,44 @@ def _first_or_raise(values: list | None, field: str) -> float:
 
 
 def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = None) -> RawReading:
-    """Sense the current moment: a heatmap call for "now", then env_params
-    against that exact same timestamp (Rule 2).
+    """Sense the current moment: a heatmap call for "now", falling back to
+    a few hours earlier if that hour has no data yet (see module
+    docstring), then env_params against whichever timestamp actually
+    succeeded (Rule 2).
     """
-    ts = now or _now_naive_utc()
-    start_date = ts.date().isoformat()
-    start_time = ts.strftime("%H:%M")
+    base_now = now or _now_naive_utc()
 
-    heatmap_response = client.create_heatmap(
-        site.polygon_geojson,
-        start_date=start_date,
-        start_time=start_time,
-        filter_type=1,
-    )
-    mean_temp_c = heatmap_response["result"]["stats_data"]["temperature_stats"]["mean"]
-    heatmap_geojson = heatmap_response["result"].get("map_data")
+    mean_temp_c = None
+    ts = None
+    heatmap_geojson = None
+    attempted_timestamps: list[datetime] = []
+
+    for hours_back in LIVE_LOOKBACK_HOURS:
+        candidate_ts = base_now - timedelta(hours=hours_back)
+        attempted_timestamps.append(candidate_ts)
+
+        heatmap_response = client.create_heatmap(
+            site.polygon_geojson,
+            start_date=candidate_ts.date().isoformat(),
+            start_time=candidate_ts.strftime("%H:%M"),
+            filter_type=1,
+        )
+        temperature_stats = heatmap_response.get("result", {}).get("stats_data", {}).get(
+            "temperature_stats"
+        )
+        if temperature_stats is not None and temperature_stats.get("mean") is not None:
+            mean_temp_c = temperature_stats["mean"]
+            ts = candidate_ts
+            heatmap_geojson = heatmap_response["result"].get("map_data")
+            break
+
+    if mean_temp_c is None:
+        attempted_str = ", ".join(t.strftime("%Y-%m-%d %H:%M") for t in attempted_timestamps)
+        raise SenseDataUnavailableError(
+            f"No heatmap temperature data available for site_id={site.id} at any of the last "
+            f"{len(LIVE_LOOKBACK_HOURS)} hourly attempts ({attempted_str}) -- FortyGuard's "
+            "pipeline may not have ingested data for this recently yet."
+        )
 
     env_response = client.environmental_parameters(
         site.lat,
