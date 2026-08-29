@@ -181,6 +181,7 @@ def query_decision_log(session, limit: int = 200) -> list[dict]:
     )
     return [
         {
+            "id": decision.id,
             "executed_at": decision.executed_at,
             "site_name": site.name,
             "crew_id": score.crew_id,
@@ -318,6 +319,36 @@ def render_decision_log(decisions: list[dict]) -> None:
         st.caption("No decisions recorded yet.")
         return
     st.dataframe(decisions, use_container_width=True, height=400)
+    render_compliance_report_downloads(decisions)
+
+
+def render_compliance_report_downloads(decisions: list[dict]) -> None:
+    """The compliance-report PDF only ever lands on this server's own
+    local disk (Phase 6: FortyGuard's signed download link is single-use,
+    so it's downloaded once rather than persisted/shared) -- Slack's
+    incoming webhook can't attach it, so this is the only place it's
+    actually reachable. report_url is a local filesystem path, not a
+    served URL, so it's read and handed to the browser here rather than
+    linked directly.
+    """
+    reports = [d for d in decisions if d.get("report_url")]
+    if not reports:
+        return
+
+    st.caption("Compliance reports")
+    for entry in reports:
+        path = Path(entry["report_url"])
+        label = f"{entry['site_name']} — crew {entry['crew_id']} ({entry['executed_at']})"
+        if path.is_file():
+            st.download_button(
+                label=f"Download report — {label}",
+                data=path.read_bytes(),
+                file_name=path.name,
+                mime="application/pdf",
+                key=f"report_{entry['id']}",
+            )
+        else:
+            st.caption(f"Report for {label} is no longer available on disk.")
 
 
 def main() -> None:

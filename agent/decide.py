@@ -121,17 +121,25 @@ def decide_and_act(
     elif tier == "caution":
         _try_act(schedule.write_shift_override, site.id, crew.id, "break_reminders")
     elif tier in ("high", "extreme"):
-        notified_channel = _try_act(
-            notify.notify_slack, f"[{tier.upper()}] {site.name}: crew {crew.id} -> {action}"
+        # Report generated before the Slack message is composed (not
+        # after, as in Phase 6's original ordering) so the message can
+        # say whether one is actually available -- the PDF only ever
+        # lands on this server's own local disk (see module docstring:
+        # FortyGuard's signed download link is single-use), and Slack's
+        # incoming webhook can't attach files at all, so a plain "-> the
+        # dashboard" pointer is the most Slack can usefully say about it.
+        report_url = _try_act(
+            compliance_report.generate_compliance_report, client, site, reading, tier
         )
+        message = f"[{tier.upper()}] {site.name}: crew {crew.id} -> {action}"
+        if report_url:
+            message += " (compliance report available on the dashboard)"
+        notified_channel = _try_act(notify.notify_slack, message)
         _try_act(
             schedule.write_shift_override,
             site.id,
             crew.id,
             "shorten_shift" if tier == "high" else "halt_work",
-        )
-        report_url = _try_act(
-            compliance_report.generate_compliance_report, client, site, reading, tier
         )
 
     decision = Decision(

@@ -118,6 +118,43 @@ def test_high_tier_notifies_and_shortens_shift(tmp_path, mocker):
     report_mock.assert_called_once()
 
 
+def test_high_tier_notify_message_points_to_dashboard_when_report_succeeds(tmp_path, mocker):
+    """The compliance-report PDF only ever lands on the server's local
+    disk (Phase 6 design: FortyGuard's signed download link is single-use,
+    so it's downloaded once rather than shared) -- Slack's incoming
+    webhook can't attach files at all. The message at least points
+    whoever reads it to where the report can actually be opened (the
+    dashboard's own download button, added alongside this).
+    """
+    notify_mock, schedule_mock, report_mock = _patch_actions(
+        mocker, notify_return="slack", report_return="/outputs/r.pdf"
+    )
+    client = MagicMock()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site, crew, reading = _seed(session)
+        decide_and_act(
+            session, client, site, crew, reading, score=115.0, tier="high", trigger_type="live"
+        )
+
+    assert "dashboard" in notify_mock.call_args.args[0].lower()
+
+
+def test_high_tier_notify_message_has_no_report_hint_when_report_fails(tmp_path, mocker):
+    notify_mock, schedule_mock, report_mock = _patch_actions(
+        mocker, notify_return="slack", report_return=None
+    )
+    client = MagicMock()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site, crew, reading = _seed(session)
+        decide_and_act(
+            session, client, site, crew, reading, score=115.0, tier="high", trigger_type="live"
+        )
+
+    assert "dashboard" not in notify_mock.call_args.args[0].lower()
+
+
 def test_extreme_tier_halts_work_notifies_and_triggers_report(tmp_path, mocker):
     notify_mock, schedule_mock, report_mock = _patch_actions(
         mocker, notify_return="slack", report_return="/outputs/r2.pdf"
