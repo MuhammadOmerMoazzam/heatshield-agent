@@ -45,7 +45,13 @@ def test_heat_intelligence_called_only_on_high_or_extreme(tier, expect_called):
     assert client.heat_intelligence.called is expect_called
 
 
-def test_report_url_attached_to_decision_record(tmp_path, mocker):
+@pytest.mark.parametrize("tier", ["high", "extreme"])
+def test_report_url_attached_to_decision_record(tmp_path, mocker, tier):
+    # Exercised through the real generate_compliance_report/heat_intelligence
+    # call chain (only notify/schedule are mocked) for both report-eligible
+    # tiers, not just "extreme" -- a tier check that broke only the "high"
+    # path would otherwise go undetected (see decide.py's own docstring:
+    # the report fires on both).
     from agent.decide import decide_and_act
 
     mocker.patch("agent.act.notify.notify_slack", return_value=None)
@@ -71,7 +77,7 @@ def test_report_url_attached_to_decision_record(tmp_path, mocker):
         session.flush()
 
         decision = decide_and_act(
-            session, client, site, crew, reading, score=130.0, tier="extreme", trigger_type="live"
+            session, client, site, crew, reading, score=130.0, tier=tier, trigger_type="live"
         )
 
         assert decision.report_url == "/outputs/heat_intelligence_xyz.pdf"

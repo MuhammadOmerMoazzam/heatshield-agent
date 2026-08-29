@@ -27,10 +27,11 @@ handled explicitly here rather than assumed away.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel
 
+from agent._shared import now_naive_utc as _now_naive_utc
 from agent.fortyguard_client import FortyGuardClient
 from agent.models import Site
 
@@ -53,10 +54,6 @@ class ForecastSignal(BaseModel):
 
 class SenseDataUnavailableError(Exception):
     """A required environmental parameter came back null from the API."""
-
-
-def _now_naive_utc() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _celsius_to_fahrenheit(celsius: float) -> float:

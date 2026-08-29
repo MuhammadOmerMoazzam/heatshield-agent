@@ -24,6 +24,8 @@ from typing import Any, Iterable
 import httpx
 from dotenv import load_dotenv
 
+from agent._shared import REPO_ROOT
+
 # So FORTYGUARD_API_KEY/FORTYGUARD_BASE_URL from .env are actually picked
 # up, not just documented in .env.example -- load_dotenv() only sets keys
 # not already in os.environ, so a real shell-exported var still wins.
@@ -451,7 +453,7 @@ class FortyGuardClient:
             "analysis": list(analysis),
         }
         activity_id = self._submit("/v1/heat_intelligence", payload)
-        result = self.wait_for(activity_id)
+        result = self.wait_for(activity_id, timeout=timeout)
         download_link = result.get("download_link")
         if not download_link:
             raise FortyGuardError(
@@ -459,14 +461,29 @@ class FortyGuardClient:
                 f"contained no download_link"
             )
 
-        target = Path(output_path) if output_path else Path("outputs") / f"heat_intelligence_{activity_id}.pdf"
+        target = (
+            Path(output_path)
+            if output_path
+            else REPO_ROOT / "outputs" / f"heat_intelligence_{activity_id}.pdf"
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.stream("GET", download_link, timeout=self.timeout) as resp:
-            if resp.status_code >= 400:
-                raise FortyGuardError(f"Downloading report -> {resp.status_code}")
-            with target.open("wb") as fh:
-                for chunk in resp.iter_bytes():
-                    fh.write(chunk)
+        dl_timeout = timeout if timeout is not None else self.timeout
+        try:
+            with httpx.stream("GET", download_link, timeout=dl_timeout) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    raise FortyGuardError(
+                        f"Downloading report -> {resp.status_code}: {resp.text[:500]}"
+                    )
+                with target.open("wb") as fh:
+                    for chunk in resp.iter_bytes():
+                        fh.write(chunk)
+        except Exception:
+            # A signed download_link is single-use -- don't leave a
+            # truncated PDF on disk that a caller might mistake for a
+            # complete report (and there's no partial link to retry).
+            target.unlink(missing_ok=True)
+            raise
         return target
 
     # ------------------------------------------------------------- credits

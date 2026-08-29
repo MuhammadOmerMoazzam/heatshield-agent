@@ -30,4 +30,4 @@ def generate_compliance_report(
         temperature=reading.heat_index,
         date=reading.ts.date().isoformat(),
     )
-    return str(result) if result is not None else None
+    return str(result)

@@ -13,8 +13,10 @@ from __future__ import annotations
 from datetime import datetime, time
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.decide import decide_and_act
-from agent.models import Crew, Reading, Score, Site, db_session
+from agent.models import Crew, Decision, Reading, Score, Site, db_session
 
 
 def _seed(session):
@@ -183,3 +185,63 @@ def test_forecast_flag_triggers_proactive_branch_not_live_branch(tmp_path, mocke
         assert live_decision.trigger_type == "live"
         assert forecast_decision.trigger_type == "forecast"
         assert live_decision.id != forecast_decision.id
+
+
+def test_decision_still_logged_when_an_action_fails(tmp_path, mocker):
+    """Regression test: a failing notify/schedule/report call used to
+    propagate out of decide_and_act and roll back the already-flushed
+    Score row via db_session's rollback-on-exception, silently discarding
+    the audit trail for the event. Each action now runs through
+    _try_act(), so the Decision row is still written with whatever
+    actually succeeded.
+    """
+    mocker.patch("agent.act.notify.notify_slack", side_effect=RuntimeError("slack unreachable"))
+    schedule_mock = mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch(
+        "agent.act.compliance_report.generate_compliance_report",
+        return_value="/outputs/r.pdf",
+    )
+    client = MagicMock()
+    db_url = f"sqlite:///{tmp_path / 't.db'}"
+
+    with db_session(db_url) as session:
+        site, crew, reading = _seed(session)
+        decision = decide_and_act(
+            session, client, site, crew, reading, score=140.0, tier="extreme", trigger_type="live"
+        )
+
+        assert decision.id is not None
+        assert decision.action_taken == "halt_and_notify_and_report"
+        # notify_slack raised -> no channel recorded, but nothing else lost.
+        assert decision.notified_channel is None
+        assert decision.report_url == "/outputs/r.pdf"
+
+    schedule_mock.assert_called_once()
+
+    with db_session(db_url) as session:
+        assert len(session.query(Score).all()) == 1
+        assert len(session.query(Decision).all()) == 1
+
+
+def test_unknown_tier_raises_clear_error_before_any_write(tmp_path, mocker):
+    _patch_actions(mocker)
+    client = MagicMock()
+    db_url = f"sqlite:///{tmp_path / 't.db'}"
+
+    with db_session(db_url) as session:
+        site, crew, reading = _seed(session)
+        with pytest.raises(ValueError, match="Unknown risk tier"):
+            decide_and_act(
+                session,
+                client,
+                site,
+                crew,
+                reading,
+                score=100.0,
+                tier="bogus",
+                trigger_type="live",
+            )
+
+    with db_session(db_url) as session:
+        assert len(session.query(Score).all()) == 0
+        assert len(session.query(Decision).all()) == 0

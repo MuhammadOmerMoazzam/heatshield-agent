@@ -10,8 +10,6 @@ from __future__ import annotations
 import os
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import (
@@ -29,6 +27,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from agent._shared import REPO_ROOT, now_naive_utc
+
 # So DATABASE_URL from .env is actually picked up, not just documented in
 # .env.example -- load_dotenv() only sets keys not already in os.environ,
 # so a real shell-exported var still wins.
@@ -40,8 +40,7 @@ Base = declarative_base()
 # scheduler job, `streamlit run`, or pytest launched from a different
 # directory would otherwise silently read/write a different data/
 # heatshield.db than intended.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATABASE_URL = f"sqlite:///{(_REPO_ROOT / 'data' / 'heatshield.db').as_posix()}"
+DEFAULT_DATABASE_URL = f"sqlite:///{(REPO_ROOT / 'data' / 'heatshield.db').as_posix()}"
 
 _session_factories: dict[str, sessionmaker] = {}
 _session_factories_lock = threading.Lock()
@@ -59,11 +58,7 @@ class Site(Base):
     # finishes has no shade data yet (Phase 4).
     shade_coverage_pct = Column(Float, nullable=True)
     canopy_pct = Column(Float, nullable=True)
-    created_at = Column(
-        DateTime,
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
-    )
+    created_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
 class Crew(Base):
