@@ -1,10 +1,13 @@
-"""Streamlit read-only dashboard for HeatShield Agent (Phase 8).
+"""Streamlit read-only dashboard for HeatShield Agent (Phase 8) plus the
+Phase 9 single-process bootstrap.
 
-Every function below reads sites/readings/scores/decisions from the DB
-only -- FortyGuardClient must not be importable from this module at all
-(enforced by tests/test_dashboard.py). The background-loop bootstrap that
-starts agent.loop.run_scheduler() (the only legitimate place credits get
-spent from a Streamlit process) is added separately in Phase 9.
+Every render/query function below reads sites/readings/scores/decisions
+from the DB only -- FortyGuardClient is never imported by name in this
+module at all (enforced by tests/test_dashboard.py). The one place
+credits get spent from this process is bootstrap_agent_loop() below,
+which starts agent.loop.run_scheduler() -- itself the only thing in this
+module that reaches (indirectly, via agent.loop) into FortyGuardClient,
+tested separately in tests/test_bootstrap.py per [SS-C.7]'s own carve-out.
 
 Query functions pull everything they need into plain dicts/lists *inside*
 their db_session() block and return that, rather than handing back ORM
@@ -12,15 +15,49 @@ objects -- db_session() commits (and therefore expires attributes) at the
 end of its `with` block, so any lazy attribute access after that point
 would hit a closed session. Keeping that boundary explicit also keeps the
 render functions themselves free of any DB/ORM coupling.
+
+Streamlit Cloud runs a single process with no separate always-on service
+for the agent loop (Part E), so this module starts it itself on load. A
+module-level flag guards against starting it twice: Streamlit reruns a
+session's script top-to-bottom on every interaction, and one process can
+serve multiple concurrent sessions -- st.session_state is scoped to a
+single session, so it wouldn't stop a *second browser tab* from starting
+a second, competing scheduler thread. A module-level flag is shared
+across every session in this process, which is the guarantee actually
+needed ("once per process," not "once per session").
 """
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import streamlit as st
 
+from agent.loop import run_scheduler
 from agent.models import Decision, Reading, Score, Site, db_session
+
+_bootstrap_lock = threading.Lock()
+_scheduler_started = False
+_scheduler_handle = None
+
+
+def bootstrap_agent_loop():
+    """Start agent.loop.run_scheduler() exactly once per process.
+
+    Safe to call on every rerun/every session -- a no-op after the first
+    successful call. Double-checked locking: the lock is only taken on
+    the (rare, first-ever) slow path, so repeated reruns within an
+    already-bootstrapped process pay no locking cost.
+    """
+    global _scheduler_started, _scheduler_handle
+    if _scheduler_started:
+        return _scheduler_handle
+    with _bootstrap_lock:
+        if not _scheduler_started:
+            _scheduler_handle = run_scheduler()
+            _scheduler_started = True
+    return _scheduler_handle
 
 RISK_TIER_COLORS = {
     "safe": "#2e7d32",
@@ -239,6 +276,7 @@ def render_decision_log(decisions: list[dict]) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="HeatShield Agent", layout="wide")
+    bootstrap_agent_loop()
     st.title("HeatShield Agent — Site Risk Dashboard")
 
     with db_session() as session:

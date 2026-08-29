@@ -1,0 +1,10 @@
+# Pinned for Streamlit Cloud (which installs from this file, not
+# pyproject.toml) and for Dockerfile parity. Versions match what Phase 0-9
+# were actually built and tested against -- regenerate with
+# `pip freeze` against a fresh .venv if these ever need bumping.
+httpx==0.28.1
+pydantic==2.13.5
+SQLAlchemy==2.0.52
+APScheduler==3.11.3
+python-dotenv==1.2.3
+streamlit==1.62.0
