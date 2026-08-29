@@ -52,7 +52,7 @@ def _heatmap_result(mean_temp_c: float = 35.0, max_temp_c: float = 40.0) -> dict
     return {
         "activity_id": "hm-1",
         "result": {
-            "stats_data": {"Temperature_stats": {"Mean": mean_temp_c, "Maximum": max_temp_c}}
+            "stats_data": {"temperature_stats": {"mean": mean_temp_c, "maximum": max_temp_c}}
         },
     }
 

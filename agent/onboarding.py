@@ -73,11 +73,18 @@ def onboard_site(
 
     start_date = reference_date or date.today().isoformat()
 
+    # Segmentation (image processing + ML inference) genuinely takes
+    # longer than the client's 60s default -- confirmed via a live call
+    # during Phase 7's integration verification, which timed out at the
+    # default before completing.
+    _SEGMENTATION_TIMEOUT = 300.0
+
     satellite_response = client.satellite_segmentation(
         latitude=site.lat,
         longitude=site.lon,
         start_date=start_date,
         filter_type=3,
+        timeout=_SEGMENTATION_TIMEOUT,
     )
     # A small positive vertical_angle captures more sky/canopy, per the
     # quickstart's own guidance for shade-and-canopy analysis.
@@ -87,6 +94,7 @@ def onboard_site(
         vertical_angle=10.0,
         horizontal_angle=0.0,
         back_view=False,
+        timeout=_SEGMENTATION_TIMEOUT,
     )
 
     site.canopy_pct = _derive_canopy_pct(satellite_response["result"])

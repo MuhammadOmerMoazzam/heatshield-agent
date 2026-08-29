@@ -83,7 +83,7 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
         start_time=start_time,
         filter_type=1,
     )
-    mean_temp_c = heatmap_response["result"]["stats_data"]["Temperature_stats"]["Mean"]
+    mean_temp_c = heatmap_response["result"]["stats_data"]["temperature_stats"]["mean"]
 
     env_response = client.environmental_parameters(
         site.lat,
@@ -127,6 +127,6 @@ def sense_forecast(
         start_time=ts.strftime("%H:%M"),
         filter_type=1,
     )
-    max_temp_c = heatmap_response["result"]["stats_data"]["Temperature_stats"]["Maximum"]
+    max_temp_c = heatmap_response["result"]["stats_data"]["temperature_stats"]["maximum"]
 
     return ForecastSignal(site_id=site.id, ts=ts, max_temp_c=max_temp_c)

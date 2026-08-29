@@ -79,7 +79,7 @@ def _envelope(data: dict) -> dict:
 
 
 def test_auth_check_returns_valid_key_status(respx_mock, client):
-    respx_mock.get(f"{BASE_URL}/v1/system/fetch-api-key-usage").mock(
+    respx_mock.post(f"{BASE_URL}/v1/system/fetch-api-key-usage").mock(
         return_value=httpx.Response(
             200,
             json=_envelope(

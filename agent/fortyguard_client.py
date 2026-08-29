@@ -489,8 +489,17 @@ class FortyGuardClient:
     # ------------------------------------------------------------- credits
 
     def fetch_api_key_usage(self) -> dict:
-        """GET /v1/system/fetch-api-key-usage -- current plan status and credit balance."""
-        body = self._request("GET", "/v1/system/fetch-api-key-usage").json()
+        """POST /v1/system/fetch-api-key-usage -- current plan status and
+        credit balance.
+
+        The live docs UI badges this endpoint "GET", but the real API
+        returns 405 Method Not Allowed for GET -- confirmed via a live
+        call during Phase 7's integration verification. POST is what
+        actually works (also matching the quickstart reference client).
+        """
+        body = self._request(
+            "POST", "/v1/system/fetch-api-key-usage", json={"api_key": self.api_key}
+        ).json()
         if body.get("error"):
             raise FortyGuardError(body.get("message", "Usage lookup failed"))
         return body.get("data", {})
