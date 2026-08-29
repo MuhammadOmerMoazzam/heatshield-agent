@@ -25,37 +25,38 @@ values come back as JSON ``null`` (never to be read as zero) -- both
 handled explicitly here rather than assumed away.
 
 Production evidence (real Streamlit Cloud logs, Phase 9, several hours
-of real scheduled cycles): a ``create_heatmap`` call for the literal
-current hour reliably succeeds (200 OK) but returns ``stats_data`` with
-no ``temperature_stats`` -- FortyGuard's pipeline evidently hasn't
-ingested/aggregated that hour's data yet, and this can lag more than a
-couple of hours behind real-time. ``environmental_parameters`` shows the
-exact same "succeeds but empty" behavior, independently, live-verified.
-A day-level ``create_heatmap`` query (``filter_type=3``, "today"), by
-contrast, has reliably had real data every time this was checked live.
+of real scheduled cycles across many attempts): an hourly
+``create_heatmap`` call (``filter_type=1``) -- for the literal current
+hour, or up to a couple of hours back -- reliably succeeds (200 OK) but
+returns ``stats_data`` with no ``temperature_stats``. Failed **100% of
+the time observed**, on both seeded sites, across many independent
+cycles. FortyGuard's pipeline evidently doesn't ingest/aggregate hourly
+data on a short enough lag for this to be worth querying at all right
+now. A day-level ``create_heatmap`` query (``filter_type=3``, "today"),
+by contrast, has reliably had real data every time this was checked
+live. Given that -- and given every hourly attempt is a separate,
+credit-metered call, and heatmap generation was observed consuming the
+large majority of this project's total API credit usage almost entirely
+on these failed hourly attempts -- the temperature layer goes straight
+to the day-level query rather than trying hourly first. (If FortyGuard's
+pipeline ends up catching up on hourly ingestion later, reintroducing an
+hourly-first attempt here is a small, self-contained change -- see git
+history for the previous hourly-then-day-level version.)
 
-Given that, ``sense_live``'s data-gathering is layered, each layer
-falling back only once the one before it comes up genuinely empty:
+``environmental_parameters`` shows the same "succeeds but empty"
+behavior independently, but less reliably absent (it has succeeded on
+a first or second attempt in real observed cases) and has no day-level
+equivalent to fall back to -- so unlike the temperature layer, it still
+retries over ``LIVE_LOOKBACK_HOURS`` before giving up, and degrades to
+``None`` (not a raised error) once every attempt is empty: a real,
+current temperature reading is worth keeping even without the small
+humidity/solar penalties ``compute_raw_stress`` (agent/score.py)
+normally adds. When this happens, ``RawReading.heat_index`` itself
+falls back to the heatmap's own ambient temperature (no humidity
+adjustment available).
 
-1. **Temperature** (``create_heatmap``): try a few hours back at hourly
-   precision (``LIVE_LOOKBACK_HOURS`` -- freshest, when available), then
-   fall back to today's day-level aggregate. Only raises
-   ``SenseDataUnavailableError`` if *that* also has no data -- live
-   evidence suggests this should be rare.
-2. **Humidity/solar/AQI** (``environmental_parameters``): tries the same
-   hourly window, against the temperature layer 1 found (Rule 2 --
-   "matching timestamp"). Unlike layer 1, there is no day-level
-   fallback for this endpoint, so if every attempt comes up empty, this
-   layer degrades to ``None`` rather than raising -- a real, current
-   temperature reading is worth keeping even without the humidity/solar
-   penalties ``compute_raw_stress`` (agent/score.py) normally adds, and
-   is a better signal than refusing to produce a reading at all. When
-   this happens, ``RawReading.heat_index`` itself falls back to the
-   heatmap's own ambient temperature (no humidity adjustment available).
-
-The returned ``RawReading.ts`` honestly reflects which hour the
-temperature data is actually from (or "now", for a day-level reading --
-there's no single hour to attribute it to).
+The returned ``RawReading.ts`` is "now" -- the day-level query has no
+single hour to honestly attribute the reading to.
 """
 
 from __future__ import annotations
@@ -98,11 +99,14 @@ class SenseDataUnavailableError(Exception):
     """
 
 
-# How many hours back sense_live retries before giving up (0 = the
-# literal current hour, tried first). Each entry is a separate,
-# credit-metered create_heatmap call, so this stays small and bounded --
-# not an unbounded/open-ended search -- rather than a blanket "keep
-# retrying forever" policy.
+# How many hours back _fetch_live_environmental_parameters retries
+# before giving up (0 = the exact matching timestamp, tried first). Only
+# used for environmental_parameters now -- the temperature layer
+# (create_heatmap) goes straight to a day-level query instead of an
+# hourly search (see module docstring). Each entry is a separate,
+# credit-metered call, so this stays small and bounded -- not an
+# unbounded/open-ended search -- rather than a blanket "keep retrying
+# forever" policy.
 LIVE_LOOKBACK_HOURS: tuple[int, ...] = (0, 1, 2)
 
 # Live-verified (Phase 9): a real environmental_parameters call hit
@@ -119,34 +123,11 @@ def celsius_to_fahrenheit(celsius: float) -> float:
 def _fetch_live_temperature(
     client: FortyGuardClient, site: Site, base_now: datetime
 ) -> tuple[float, datetime, dict | None]:
-    """Layer 1: a few hours back at hourly precision, then today's
-    day-level aggregate. Returns (mean_temp_c, ts, heatmap_geojson).
-    Raises SenseDataUnavailableError only if the day-level fallback also
-    has no data -- see module docstring.
+    """Layer 1: today's day-level aggregate directly -- see module
+    docstring for why hourly is skipped entirely here. Returns
+    (mean_temp_c, ts, heatmap_geojson). Raises SenseDataUnavailableError
+    if the day-level query has no data either.
     """
-    attempted: list[str] = []
-
-    for hours_back in LIVE_LOOKBACK_HOURS:
-        candidate_ts = base_now - timedelta(hours=hours_back)
-        attempted.append(candidate_ts.strftime("%Y-%m-%d %H:%M"))
-
-        heatmap_response = client.create_heatmap(
-            site.polygon_geojson,
-            start_date=candidate_ts.date().isoformat(),
-            start_time=candidate_ts.strftime("%H:%M"),
-            filter_type=1,
-            timeout=_SENSE_TIMEOUT,
-        )
-        temperature_stats = heatmap_response.get("result", {}).get("stats_data", {}).get(
-            "temperature_stats"
-        )
-        if temperature_stats is not None and temperature_stats.get("mean") is not None:
-            return (
-                temperature_stats["mean"],
-                candidate_ts,
-                heatmap_response["result"].get("map_data"),
-            )
-
     day_response = client.create_heatmap(
         site.polygon_geojson,
         start_date=base_now.date().isoformat(),
@@ -159,11 +140,10 @@ def _fetch_live_temperature(
     if day_temperature_stats is not None and day_temperature_stats.get("mean") is not None:
         return day_temperature_stats["mean"], base_now, day_response["result"].get("map_data")
 
-    attempted_str = ", ".join(attempted)
     raise SenseDataUnavailableError(
-        f"No heatmap temperature data available for site_id={site.id} at any of the last "
-        f"{len(LIVE_LOOKBACK_HOURS)} hourly attempts ({attempted_str}) or today's day-level "
-        "aggregate -- FortyGuard's pipeline may not have ingested data for this site recently."
+        f"No heatmap temperature data available for site_id={site.id}'s day-level aggregate "
+        f"({base_now.date().isoformat()}) -- FortyGuard's pipeline may not have ingested data "
+        "for this site recently."
     )
 
 
@@ -240,37 +220,27 @@ def sense_forecast(
     """Sense the +12h forecast: heatmap only, no env_params call, since the
     handbook doesn't guarantee forecast support there.
 
-    A forecast necessarily queries a not-yet-elapsed hour, so the same
-    "succeeds but empty" lag sense_live's hourly queries show (see module
-    docstring) can hit this specific forecasted hour too -- if anything,
-    even more likely, since it hasn't happened yet. Falls back to that
-    target day's day-level peak rather than raising the raw KeyError this
-    used to surface as.
+    Goes straight to that target day's day-level peak, the same as
+    sense_live's temperature layer and for the same reason (see module
+    docstring) -- an hourly query for a not-yet-elapsed forecast hour has
+    shown the identical "succeeds but empty" behavior in live testing,
+    if anything even more reliably than sense_live's, since the hour
+    genuinely hasn't happened yet.
     """
     ts = (now or _now_naive_utc()) + timedelta(hours=12)
-
-    heatmap_response = client.create_heatmap(
-        site.polygon_geojson,
-        start_date=ts.date().isoformat(),
-        start_time=ts.strftime("%H:%M"),
-        filter_type=1,
-        timeout=_SENSE_TIMEOUT,
-    )
-    temperature_stats = heatmap_response.get("result", {}).get("stats_data", {}).get(
-        "temperature_stats"
-    )
-    if temperature_stats is not None and temperature_stats.get("maximum") is not None:
-        return ForecastSignal(
-            site_id=site.id,
-            ts=ts,
-            max_temp_c=temperature_stats["maximum"],
-            heatmap_geojson=heatmap_response["result"].get("map_data"),
-        )
 
     day_response = client.create_heatmap(
         site.polygon_geojson,
         start_date=ts.date().isoformat(),
         filter_type=3,
+        # start_time is otherwise unused for a day-level query (the API
+        # ignores it per the quickstart docs), but keeping it here is
+        # what makes the client's own client-side +12h forecast-window
+        # guard (_validate_forecast_window, which only checks start_time
+        # when one is given) still fire *before* any network call --
+        # without it, an out-of-window forecast request would go
+        # straight to the real API instead of being rejected locally.
+        start_time=ts.strftime("%H:%M"),
         timeout=_SENSE_TIMEOUT,
     )
     day_temperature_stats = day_response.get("result", {}).get("stats_data", {}).get(
@@ -285,7 +255,7 @@ def sense_forecast(
         )
 
     raise SenseDataUnavailableError(
-        f"No heatmap temperature data available for site_id={site.id}'s +12h forecast "
-        f"({ts.strftime('%Y-%m-%d %H:%M')}) or that day's day-level aggregate -- FortyGuard's "
-        "pipeline may not have ingested forecast data for this site recently."
+        f"No heatmap temperature data available for site_id={site.id}'s +12h forecast day-level "
+        f"aggregate ({ts.date().isoformat()}) -- FortyGuard's pipeline may not have ingested "
+        "forecast data for this site recently."
     )
