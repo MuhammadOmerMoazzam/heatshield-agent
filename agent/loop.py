@@ -90,6 +90,23 @@ def _check_credits(client: FortyGuardClient, credit_floor: int) -> bool:
 def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = False) -> list[Decision]:
     """One full pass: for every site with at least one crew, sense live +
     forecast, then score and decide for every crew at that site.
+
+    Each SAVEPOINT-scoped unit of work below is followed by an explicit
+    session.commit() rather than deferring every commit to db_session()'s
+    single one at the very end. Real production bug, live-observed:
+    'sqlite3.OperationalError: database is locked' reappeared even with
+    WAL mode + a busy_timeout already in place, once a single
+    transaction spanned a site's *entire* live+forecast branches --
+    including their slow, sometimes-300s-timeout API calls. SQLite's
+    write lock, once taken by a transaction's first write, is held for
+    that whole transaction's remaining lifetime, even through the long
+    stretches where nothing is actually being written -- long enough for
+    another writer (the scheduler's own heartbeat job, agent/loop.py's
+    run_scheduler; a concurrent orphaned scheduler) to exceed even a
+    generous busy_timeout. Committing after each small, fast write keeps
+    the lock held for milliseconds at a time instead of minutes, and (as
+    a bonus) makes every site's/crew's work durable immediately rather
+    than only at the very end of a potentially very long cycle.
     """
     decisions: list[Decision] = []
 
@@ -109,11 +126,9 @@ def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = Fals
                 # A flush failure leaves the SQLAlchemy session in an
                 # INACTIVE state (per Session._flush()'s own exception
                 # handling) requiring an explicit rollback before the
-                # session is usable again -- but a plain session.rollback()
-                # would undo *every* site processed so far in this cycle,
-                # since nothing commits until db_session()'s single commit
-                # at the very end. A SAVEPOINT (begin_nested) scopes the
-                # rollback to just this site's onboarding attempt.
+                # session is usable again -- a SAVEPOINT (begin_nested)
+                # scopes that rollback to just this site's onboarding
+                # attempt, not any other site's already-committed work.
                 with session.begin_nested():
                     onboard_site(client, site)
                     session.flush()
@@ -123,19 +138,24 @@ def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = Fals
                     site.id,
                     site.name,
                 )
+            session.commit()
 
         # A failure sensing/scoring THIS site (a bad heatmap, a rejected
         # AOI, etc.) must not crash the whole cycle and skip every other
-        # site -- log it and move on. Same SAVEPOINT reasoning as above.
+        # site -- log it and move on. _run_site_cycle handles its own
+        # SAVEPOINTs/commits per unit of work internally; this rollback
+        # is just a defensive backstop for anything that escapes all of
+        # those (a bug, not the expected path) so the session is still
+        # usable for the next site.
         try:
-            with session.begin_nested():
-                decisions.extend(_run_site_cycle(session, client, site, crews))
+            decisions.extend(_run_site_cycle(session, client, site, crews))
         except Exception:
             logger.exception(
                 "Sense/score/decide failed for site_id=%s (%s); skipping this site this cycle.",
                 site.id,
                 site.name,
             )
+            session.rollback()
 
     return decisions
 
@@ -143,20 +163,36 @@ def run_cycle(session, client: FortyGuardClient, *, skip_onboarding: bool = Fals
 def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[Crew]) -> list[Decision]:
     decisions: list[Decision] = []
 
-    # Live (reactive) branch.
-    raw_reading = sense_live(client, site)
-    reading = Reading(
-        site_id=site.id,
-        ts=raw_reading.ts,
-        heat_index=raw_reading.heat_index,
-        aqi=raw_reading.aqi,
-        humidity=raw_reading.humidity,
-        solar_irradiance=raw_reading.solar_irradiance,
-        is_forecast=False,
-        heatmap_geojson=raw_reading.heatmap_geojson,
-    )
-    session.add(reading)
-    session.flush()
+    # Live (reactive) branch. Its own SAVEPOINT + commit, separate from
+    # the per-crew loop below: a flush failure here (a bad sense_live
+    # response) needs the same INACTIVE-session recovery as onboarding's,
+    # and committing immediately after releases the write lock before
+    # the crew loop's own (Slack/PDF) side effects and well before the
+    # forecast branch's own slow sensing call.
+    try:
+        with session.begin_nested():
+            raw_reading = sense_live(client, site)
+            reading = Reading(
+                site_id=site.id,
+                ts=raw_reading.ts,
+                heat_index=raw_reading.heat_index,
+                aqi=raw_reading.aqi,
+                humidity=raw_reading.humidity,
+                solar_irradiance=raw_reading.solar_irradiance,
+                is_forecast=False,
+                heatmap_geojson=raw_reading.heatmap_geojson,
+            )
+            session.add(reading)
+            session.flush()
+    except Exception:
+        logger.exception(
+            "Live sensing failed for site_id=%s (%s); this site is skipped this cycle.",
+            site.id,
+            site.name,
+        )
+        session.commit()
+        return decisions
+    session.commit()
 
     # Each crew gets its own SAVEPOINT + try/except: code-review-caught,
     # empirically reproduced regression -- with only the outer per-site
@@ -189,6 +225,7 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
                 site.id,
                 site.name,
             )
+        session.commit()
 
     # Forecast (proactive) branch -- heatmap only, no env_params call
     # (Rule 2 / Phase 5), so there's no humidity/solar signal to run
@@ -199,10 +236,10 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
     #
     # Isolated in its own try/except + SAVEPOINT: a forecast-sensing
     # failure (a rejected AOI, a server-side task failure) must not
-    # discard the live branch's already-flushed rows above -- a plain
-    # session.rollback() here would undo the live branch's work too,
-    # since both branches share this same uncommitted transaction; a
-    # SAVEPOINT scopes the rollback to just the forecast branch.
+    # discard the live branch's already-flushed rows above -- they're
+    # already committed by this point (see above), so this SAVEPOINT is
+    # really just for the INACTIVE-session recovery a flush failure
+    # needs, same as the live branch's own.
     forecast_reading = None
     forecast_temp_f = None
     forecast_tier = None
@@ -234,6 +271,7 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
             site.id,
             site.name,
         )
+    session.commit()
 
     # Same per-crew isolation as the live branch above, and for the same
     # reason -- a SAVEPOINT around the whole crew loop (the original
@@ -262,6 +300,7 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
                     site.id,
                     site.name,
                 )
+            session.commit()
 
     return decisions
 

@@ -180,6 +180,110 @@ def test_full_cycle_safe_reading_produces_no_side_effects(tmp_path, mocker):
     report_mock.assert_not_called()
 
 
+def test_run_cycle_does_not_hold_the_write_lock_across_a_slow_sites_whole_cycle(
+    tmp_path, mocker
+):
+    """Real production bug, live-observed: 'sqlite3.OperationalError:
+    database is locked' reappeared even with WAL mode + a 30s
+    busy_timeout already in place, right after two other changes landed
+    together -- fixing a pysqlite bug that was, as a side effect,
+    releasing the write lock early at every SAVEPOINT boundary (masking
+    this), and adding a periodic heartbeat job (agent.loop.run_scheduler)
+    that writes every few minutes. With ONE transaction spanning a
+    site's entire live+forecast branches -- including their slow,
+    sometimes-300s-timeout API calls -- the write lock stays held that
+    whole time even though nothing is actually being written for most of
+    it, long enough for a concurrent writer to exceed even a 30s
+    busy_timeout.
+
+    Simulates a slow site -- a real sleep inside the mocked
+    sense_forecast, which runs *after* the live branch has already
+    written its Reading (and, on the fixed pysqlite transaction mode,
+    is holding the write lock continuously from that point on) -- and
+    confirms a *separate* connection can still write successfully during
+    that slow window, proving the lock isn't held across it.
+
+    Uses a short busy_timeout (not the real 30s) so a held-too-long lock
+    fails fast and this test doesn't itself take 30+ seconds to prove
+    the point.
+    """
+    import threading
+    import time as time_module
+
+    from sqlalchemy import event
+
+    from agent.models import _configure_sqlite_for_concurrent_access
+    from agent.sense import sense_forecast
+
+    def _short_busy_timeout(engine):
+        @event.listens_for(engine, "connect")
+        def _set_short_busy_timeout(dbapi_connection, connection_record):
+            dbapi_connection.isolation_level = None
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=300")
+            cursor.close()
+
+        @event.listens_for(engine, "begin")
+        def _begin(conn):
+            conn.exec_driver_sql("BEGIN")
+
+    mocker.patch("agent.models._configure_sqlite_for_concurrent_access", side_effect=_short_busy_timeout)
+
+    database_url = f"sqlite:///{tmp_path / 't.db'}"
+    with db_session(database_url) as session:
+        site, _ = _seed(session)
+        site_id = site.id
+
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result()
+    client.environmental_parameters.return_value = _env_params_result()
+
+    real_sense_forecast = sense_forecast
+
+    def _slow_sense_forecast(client_, site_):
+        time_module.sleep(2.0)
+        return real_sense_forecast(client_, site_)
+
+    mocker.patch("agent.loop.sense_forecast", side_effect=_slow_sense_forecast)
+    mocker.patch("agent.act.notify.notify_slack")
+    mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch("agent.act.compliance_report.generate_compliance_report")
+
+    other_writer_result: dict[str, object] = {"succeeded": False, "error": None}
+
+    def _other_writer() -> None:
+        time_module.sleep(0.5)  # let the live branch's own write land first
+        try:
+            with db_session(database_url) as other_session:
+                other_session.add(
+                    Crew(
+                        site_id=site_id,
+                        work_intensity="light",
+                        ppe_class="Class 1",
+                        active_shift_start=time(0, 0),
+                        active_shift_end=time(1, 0),
+                    )
+                )
+            other_writer_result["succeeded"] = True
+        except Exception as exc:  # pragma: no cover - failure path is the point
+            other_writer_result["error"] = exc
+
+    thread = threading.Thread(target=_other_writer)
+    thread.start()
+
+    with db_session(database_url) as session:
+        run_cycle(session, client, skip_onboarding=True)
+
+    thread.join(timeout=15)
+    assert other_writer_result["error"] is None, other_writer_result["error"]
+    assert other_writer_result["succeeded"], (
+        "a concurrent writer should succeed well within busy_timeout while "
+        "run_cycle is mid-cycle on a slow site, not be blocked by a lock held "
+        "across the whole site's live+forecast branches"
+    )
+
+
 def test_full_cycle_extreme_reading_produces_halt_alert_and_report(tmp_path, mocker):
     """The live branch halts work, notifies, and reports. The forecast
     branch (same underlying heatmap data, since the mocked client returns
