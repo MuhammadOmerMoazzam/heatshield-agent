@@ -8,6 +8,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
@@ -374,6 +375,135 @@ def test_pre_existing_database_gets_sites_onboarded_at_column_backfilled(tmp_pat
     with db_session(database_url) as session:
         site = session.query(Site).one()
         assert site.onboarded_at is None
+
+
+def test_pre_existing_database_gets_missing_phase8_media_columns_backfilled(tmp_path):
+    """Same class of gap as the onboarded_at case above, but for the
+    Phase 8 media columns (Site.satellite_image_path/satellite_legend/
+    streetview_image_path/streetview_legend, Reading.heatmap_geojson) --
+    and proof the backfill mechanism is now generic (any nullable column
+    missing from an existing table gets added) rather than a bespoke
+    function that has to be hand-extended by name every time a new
+    nullable column is added.
+    """
+    db_path = tmp_path / "pre_existing_media.db"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute(
+        """
+        CREATE TABLE sites (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            lat FLOAT NOT NULL,
+            lon FLOAT NOT NULL,
+            polygon_geojson TEXT NOT NULL,
+            shade_coverage_pct FLOAT,
+            canopy_pct FLOAT,
+            created_at DATETIME NOT NULL
+        )
+        """
+    )
+    raw_conn.commit()
+    raw_conn.close()
+
+    database_url = f"sqlite:///{db_path}"
+    with db_session(database_url) as session:
+        session.add(
+            Site(
+                name="Old Site",
+                lat=0.0,
+                lon=0.0,
+                polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+            )
+        )
+
+    with db_session(database_url) as session:
+        site = session.query(Site).one()
+        assert site.satellite_image_path is None
+        assert site.satellite_legend is None
+        assert site.streetview_image_path is None
+        assert site.streetview_legend is None
+        assert site.onboarded_at is None
+
+
+def test_pre_existing_database_relaxes_not_null_on_readings_humidity_and_solar_irradiance(
+    tmp_path,
+):
+    """Real bug, confirmed via git history: Reading.humidity/
+    solar_irradiance were originally NOT NULL (Phase 2) and later relaxed
+    to nullable=True (Phase 9's live fix, once environmental_parameters
+    was confirmed to sometimes return no data at all). SQLite bakes
+    NOT NULL into the column itself -- changing the Python model doesn't
+    relax an already-existing table, and unlike a missing column, SQLite
+    can't ALTER a column's constraint in place. This needs an actual
+    table rebuild (create fresh, copy rows, swap in), not a plain
+    ADD COLUMN -- deferred earlier this session as too risky to do
+    live without a test proving it first; this is that test.
+    """
+    db_path = tmp_path / "pre_existing_readings.db"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute(
+        """
+        CREATE TABLE sites (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            lat FLOAT NOT NULL,
+            lon FLOAT NOT NULL,
+            polygon_geojson TEXT NOT NULL,
+            shade_coverage_pct FLOAT,
+            canopy_pct FLOAT,
+            created_at DATETIME NOT NULL
+        )
+        """
+    )
+    raw_conn.execute(
+        """
+        CREATE TABLE readings (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL,
+            ts DATETIME NOT NULL,
+            heat_index FLOAT NOT NULL,
+            aqi FLOAT,
+            humidity FLOAT NOT NULL,
+            solar_irradiance FLOAT NOT NULL,
+            is_forecast BOOLEAN NOT NULL
+        )
+        """
+    )
+    raw_conn.execute(
+        "INSERT INTO sites (name, lat, lon, polygon_geojson, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("Old Site", 0.0, 0.0, '{"type": "Polygon", "coordinates": [[[0, 0]]]}', "2026-01-01 00:00:00"),
+    )
+    raw_conn.execute(
+        "INSERT INTO readings (site_id, ts, heat_index, aqi, humidity, solar_irradiance, is_forecast) "
+        "VALUES (1, '2026-01-01 00:00:00', 90.0, 50.0, 40.0, 500.0, 0)"
+    )
+    raw_conn.commit()
+    raw_conn.close()
+
+    database_url = f"sqlite:///{db_path}"
+    with db_session(database_url) as session:
+        # The pre-existing row must survive the rebuild untouched.
+        old_reading = session.query(Reading).one()
+        assert old_reading.heat_index == pytest.approx(90.0)
+        assert old_reading.humidity == pytest.approx(40.0)
+
+        # The whole point: a genuinely-unknown humidity/solar_irradiance
+        # must now be insertable -- the old NOT NULL constraint would
+        # have rejected this with an IntegrityError.
+        session.add(
+            Reading(
+                site_id=old_reading.site_id,
+                ts=datetime(2026, 1, 2),
+                heat_index=95.0,
+                aqi=None,
+                humidity=None,
+                solar_irradiance=None,
+                is_forecast=False,
+            )
+        )
+
+    with db_session(database_url) as session:
+        assert session.query(Reading).count() == 2
 
 
 def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):

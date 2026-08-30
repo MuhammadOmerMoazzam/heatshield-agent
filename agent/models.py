@@ -260,28 +260,93 @@ def _backfill_sites_name_unique_index(engine) -> None:
         )
 
 
-def _backfill_sites_onboarded_at_column(engine) -> None:
-    """Real bug, live-observed: Site.onboarded_at (added to fix the
-    seeded-demo-site-never-really-onboarded bug -- see Site.onboarded_at's
-    own comment) is only added by Base.metadata.create_all() below, which
-    creates *missing* tables but never alters an already-existing one --
-    so a persisted heatshield.db predating this column would raise
-    "no such column: sites.onboarded_at" on every single query the moment
-    this module's Site model expects it to exist. Unlike the sites.name
-    UNIQUE constraint above, a plain nullable column with no default is
+def _backfill_missing_nullable_columns(engine) -> None:
+    """Generic version of a fix first written narrowly for
+    sites.onboarded_at: any nullable column added to a model after its
+    table already exists (onboarded_at; Site.satellite_image_path/
+    satellite_legend/streetview_image_path/streetview_legend and
+    Reading.heatmap_geojson from Phase 8, both predating this generic
+    version and never backfilled) is only added by
+    Base.metadata.create_all() below, which creates *missing* tables but
+    never alters an already-existing one -- so a persisted heatshield.db
+    predating any of these columns would raise "no such column" on every
+    query that touches it. A plain nullable column with no default is
     exactly what SQLite's own ALTER TABLE ADD COLUMN supports directly --
-    no full-table-rebuild workaround needed here.
+    no full-table-rebuild workaround needed for this case (see
+    _backfill_readings_nullable_environmental_columns below for the case
+    that does need one). Runs once per table, for every column declared
+    on the model but absent from the live table.
     """
     try:
         with engine.begin() as conn:
-            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(sites)").fetchall()}
-            if "onboarded_at" not in columns:
-                conn.exec_driver_sql("ALTER TABLE sites ADD COLUMN onboarded_at DATETIME")
+            for table in Base.metadata.sorted_tables:
+                existing_columns = {
+                    row[1]
+                    for row in conn.exec_driver_sql(f"PRAGMA table_info({table.name})").fetchall()
+                }
+                if not existing_columns:
+                    continue  # table itself doesn't exist yet -- create_all()'s job
+                for column in table.columns:
+                    if column.name in existing_columns or not column.nullable:
+                        continue
+                    column_type = column.type.compile(dialect=conn.dialect)
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column_type}"
+                    )
     except Exception:
         logger.warning(
-            "Could not backfill sites.onboarded_at onto an existing database -- "
-            "onboarding may re-run for sites that already have it if this "
-            "column genuinely couldn't be added.",
+            "Could not backfill missing nullable columns onto an existing "
+            "database -- some features may be unavailable on this specific "
+            "database file until this is resolved by hand.",
+            exc_info=True,
+        )
+
+
+def _backfill_readings_nullable_environmental_columns(engine) -> None:
+    """Real bug, deferred earlier this session pending a test proving it
+    first (see tests/test_models.py's
+    test_pre_existing_database_relaxes_not_null_on_readings_humidity_and_solar_irradiance):
+    Reading.humidity/solar_irradiance were originally NOT NULL (Phase 2)
+    and later relaxed to nullable=True (Phase 9's live fix, once
+    environmental_parameters was confirmed to sometimes return no data at
+    all for a given cycle). SQLite bakes NOT NULL into the column itself
+    -- changing the Python model doesn't relax an already-existing table,
+    and unlike a missing column, SQLite can't ALTER a column's constraint
+    in place. The standard workaround is a table rebuild: create the
+    table fresh under today's (correct) shape, copy every row across
+    using only the columns the old table actually had, then swap it in
+    for the original.
+    """
+    try:
+        with engine.begin() as conn:
+            columns = conn.exec_driver_sql("PRAGMA table_info(readings)").fetchall()
+            if not columns:
+                return  # table doesn't exist yet -- create_all()'s job
+            by_name = {row[1]: row for row in columns}
+            still_not_null = any(
+                by_name[name][3] == 1  # PRAGMA table_info's notnull flag
+                for name in ("humidity", "solar_irradiance")
+                if name in by_name
+            )
+            if not still_not_null:
+                return
+
+            conn.exec_driver_sql("ALTER TABLE readings RENAME TO readings_pre_nullable_migration")
+            Reading.__table__.create(conn)
+            shared_columns = ", ".join(
+                name for name in by_name if name in Reading.__table__.columns.keys()
+            )
+            conn.exec_driver_sql(
+                f"INSERT INTO readings ({shared_columns}) "
+                f"SELECT {shared_columns} FROM readings_pre_nullable_migration"
+            )
+            conn.exec_driver_sql("DROP TABLE readings_pre_nullable_migration")
+    except Exception:
+        logger.warning(
+            "Could not relax NOT NULL on readings.humidity/solar_irradiance "
+            "for an existing database -- inserting a genuinely-unknown "
+            "humidity/solar_irradiance reading may still fail on this "
+            "specific database file until this is resolved by hand.",
             exc_info=True,
         )
 
@@ -307,7 +372,8 @@ def _get_session_factory(database_url: str) -> sessionmaker:
             Base.metadata.create_all(engine)
             if url_obj.get_backend_name() == "sqlite":
                 _backfill_sites_name_unique_index(engine)
-                _backfill_sites_onboarded_at_column(engine)
+                _backfill_missing_nullable_columns(engine)
+                _backfill_readings_nullable_environmental_columns(engine)
             # expire_on_commit=False: db_session() closes its session
             # immediately after commit (see below), and callers like
             # agent.loop.run_once() return ORM rows straight out of that
