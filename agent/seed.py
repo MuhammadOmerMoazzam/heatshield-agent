@@ -80,6 +80,46 @@ HOUSTON_POLYGON = {
     ],
 }
 
+MIAMI_POLYGON = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-80.20, 25.71],
+                    [-80.10, 25.71],
+                    [-80.10, 25.81],
+                    [-80.20, 25.81],
+                    [-80.20, 25.71],
+                ]],
+            },
+        }
+    ],
+}
+
+LAS_VEGAS_POLYGON = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-115.19, 36.12],
+                    [-115.09, 36.12],
+                    [-115.09, 36.22],
+                    [-115.19, 36.22],
+                    [-115.19, 36.12],
+                ]],
+            },
+        }
+    ],
+}
+
 _DEMO_SITES = [
     {
         "name": "Phoenix, AZ — Warehouse District",
@@ -107,6 +147,34 @@ _DEMO_SITES = [
             "ppe_class": "Class 1",
             "active_shift_start": time(6, 0),
             "active_shift_end": time(14, 0),
+        },
+    },
+    {
+        "name": "Miami, FL — Construction Corridor",
+        "lat": 25.7617,
+        "lon": -80.1918,
+        "polygon_geojson": MIAMI_POLYGON,
+        "shade_coverage_pct": 22.0,
+        "canopy_pct": 10.0,
+        "crew": {
+            "work_intensity": "moderate",
+            "ppe_class": "Class 2",
+            "active_shift_start": time(7, 0),
+            "active_shift_end": time(15, 0),
+        },
+    },
+    {
+        "name": "Las Vegas, NV — Outdoor Event Grounds",
+        "lat": 36.1699,
+        "lon": -115.1398,
+        "polygon_geojson": LAS_VEGAS_POLYGON,
+        "shade_coverage_pct": 10.0,
+        "canopy_pct": 4.0,
+        "crew": {
+            "work_intensity": "heavy",
+            "ppe_class": "Class 2",
+            "active_shift_start": time(5, 0),
+            "active_shift_end": time(13, 0),
         },
     },
 ]
