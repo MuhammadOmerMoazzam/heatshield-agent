@@ -122,11 +122,19 @@ def celsius_to_fahrenheit(celsius: float) -> float:
 
 def _fetch_live_temperature(
     client: FortyGuardClient, site: Site, base_now: datetime
-) -> tuple[float, datetime, dict | None]:
+) -> tuple[float, datetime]:
     """Layer 1: today's day-level aggregate directly -- see module
     docstring for why hourly is skipped entirely here. Returns
-    (mean_temp_c, ts, heatmap_geojson). Raises SenseDataUnavailableError
-    if the day-level query has no data either.
+    (mean_temp_c, ts). Raises SenseDataUnavailableError if the day-level
+    query has no data either.
+
+    The response's own map_data (a day-level tile FeatureCollection) is
+    deliberately never read here -- live-verified over 1 million
+    characters for a single reading, and persisting it was directly
+    implicated in recurring "database is locked" failures (a large
+    single-row insert holds the write transaction open longer, widening
+    the collision window with the background scheduler's other writes)
+    plus fast, unbounded SQLite file growth.
     """
     day_response = client.create_heatmap(
         site.polygon_geojson,
@@ -138,7 +146,7 @@ def _fetch_live_temperature(
         "temperature_stats"
     )
     if day_temperature_stats is not None and day_temperature_stats.get("mean") is not None:
-        return day_temperature_stats["mean"], base_now, day_response["result"].get("map_data")
+        return day_temperature_stats["mean"], base_now
 
     raise SenseDataUnavailableError(
         f"No heatmap temperature data available for site_id={site.id}'s day-level aggregate "
@@ -189,7 +197,7 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
     """
     base_now = now or _now_naive_utc()
 
-    mean_temp_c, ts, heatmap_geojson = _fetch_live_temperature(client, site, base_now)
+    mean_temp_c, ts = _fetch_live_temperature(client, site, base_now)
     heat_index_c, humidity, ghi, aqi = _fetch_live_environmental_parameters(
         client, site, mean_temp_c, ts
     )
@@ -210,7 +218,9 @@ def sense_live(client: FortyGuardClient, site: Site, *, now: datetime | None = N
         humidity=humidity,
         solar_irradiance=ghi,
         is_forecast=False,
-        heatmap_geojson=heatmap_geojson,
+        # heatmap_geojson deliberately never populated -- see
+        # _fetch_live_temperature's docstring.
+        heatmap_geojson=None,
     )
 
 
@@ -251,7 +261,9 @@ def sense_forecast(
             site_id=site.id,
             ts=ts,
             max_temp_c=day_temperature_stats["maximum"],
-            heatmap_geojson=day_response["result"].get("map_data"),
+            # heatmap_geojson deliberately never populated -- see
+            # _fetch_live_temperature's docstring.
+            heatmap_geojson=None,
         )
 
     raise SenseDataUnavailableError(

@@ -188,25 +188,19 @@ def test_sense_live_falls_back_to_ambient_temperature_when_env_params_has_no_dat
     assert reading.aqi is None
 
 
-def test_sense_live_captures_heatmap_tile_geojson_for_dashboard():
-    """Phase 8: the dashboard's map panel renders the tile FeatureCollection
-    a heatmap call already returns -- it must not be discarded after the
-    mean/max stats are pulled out of it.
+def test_sense_live_never_stores_heatmap_geojson():
+    """Live-verified (Phase 9): a day-level heatmap's tile FeatureCollection
+    can be enormous -- over 1 million characters for a single reading in
+    real production data -- and persisting it was directly implicated in
+    recurring 'database is locked' failures (a large single-row insert
+    holds the write transaction open longer, widening the collision
+    window) plus fast, unbounded SQLite file growth. Deliberately no
+    longer stored, even when the API response carries one, regardless of
+    reading.ts.
     """
     map_data = {"type": "FeatureCollection", "features": [{"properties": {"temperature": 35.0}}]}
     client = MagicMock()
     client.create_heatmap.return_value = _heatmap_result(map_data=map_data)
-    client.environmental_parameters.return_value = _env_params_result()
-    site = _make_site()
-
-    reading = sense_live(client, site)
-
-    assert reading.heatmap_geojson == map_data
-
-
-def test_sense_live_heatmap_geojson_defaults_to_none_when_absent():
-    client = MagicMock()
-    client.create_heatmap.return_value = _heatmap_result()  # no map_data
     client.environmental_parameters.return_value = _env_params_result()
     site = _make_site()
 
@@ -241,7 +235,9 @@ def test_sense_forecast_calls_only_heatmap():
     assert signal.max_temp_c == 41.5
 
 
-def test_sense_forecast_captures_heatmap_tile_geojson_for_dashboard():
+def test_sense_forecast_never_stores_heatmap_geojson():
+    """Same reasoning as sense_live -- see
+    test_sense_live_never_stores_heatmap_geojson."""
     map_data = {"type": "FeatureCollection", "features": [{"properties": {"temperature": 41.5}}]}
     client = MagicMock()
     client.create_heatmap.return_value = _heatmap_result(max_temp_c=41.5, map_data=map_data)
@@ -249,7 +245,7 @@ def test_sense_forecast_captures_heatmap_tile_geojson_for_dashboard():
 
     signal = sense_forecast(client, site)
 
-    assert signal.heatmap_geojson == map_data
+    assert signal.heatmap_geojson is None
 
 
 def test_sense_forecast_raises_clear_error_when_day_level_heatmap_has_no_data():

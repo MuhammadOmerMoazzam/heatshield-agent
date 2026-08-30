@@ -165,12 +165,15 @@ def test_full_cycle_safe_reading_produces_no_side_effects(tmp_path, mocker):
         for decision in decisions:
             assert decision.action_taken == "none"
 
-        # Phase 8: the dashboard's map panel reads this straight off the
-        # reading row -- the loop must persist it, not just sense.py return it.
+        # Phase 9: heatmap_geojson is deliberately never persisted -- a
+        # day-level tile FeatureCollection was live-verified as over 1
+        # million characters for a single reading, and storing it was
+        # directly implicated in recurring "database is locked" failures
+        # plus fast, unbounded SQLite growth (see agent/sense.py).
         readings = session.query(Reading).all()
         assert len(readings) == 2
         for reading in readings:
-            assert reading.heatmap_geojson["features"][0]["properties"]["temperature"] == 25.0
+            assert reading.heatmap_geojson is None
 
     notify_mock.assert_not_called()
     schedule_mock.assert_not_called()
