@@ -5,6 +5,7 @@
 An autonomous agent that senses real-time and forecast heat conditions at outdoor worksites, scores each crew's actual exposure risk (not just ambient temperature), and — without a human in the loop — decides and takes a concrete action: nothing, a break reminder, a shortened shift with a Slack alert, or a full work stoppage with a compliance report.
 
 Live demo: **https://heatshield-agent.streamlit.app/**
+
 Slack alerts workspace: **https://join.slack.com/t/heatshield/shared_invite/zt-48bp2635i-NX7zlSiVSIKKySzbwMvxMQ** — join to see live heat-risk alerts as the agent sends them.
 
 ---
