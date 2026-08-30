@@ -136,6 +136,35 @@ class Decision(Base):
     trigger_type = Column(String, nullable=False)
 
 
+class SchedulerLock(Base):
+    """Singleton row (fixed id=1) guarding against more than one live
+    agent.loop.run_scheduler() actually running against this database.
+
+    Real production bug, live-observed: a Streamlit-Cloud-only in-memory
+    guard (dashboard/app.py's module-level _scheduler_started flag)
+    assumes "one process" -- but live logs showed the same site failing
+    far more often than a 6-hour interval allows (5 failures, each
+    costing close to a 300s timeout, inside an 11-minute window: not
+    enough time for that many *sequential* failures), meaning multiple
+    schedulers were running concurrently against the same credits. The
+    most likely cause is Streamlit Cloud not always fully killing a prior
+    process's threads across the many reboots/redeploys this project has
+    gone through -- an in-memory flag in a NEW process can't know about
+    an OLD process's still-running scheduler; the database file is the
+    one thing confirmed to be genuinely shared across however many of
+    "these" exist. heartbeat_at (not a one-time claim-and-forget) lets a
+    genuinely dead orphan's lock be reclaimed later rather than
+    permanently bricking the scheduler after a clean reboot -- see
+    agent.loop._claim_scheduler_lock/_renew_scheduler_lock.
+    """
+
+    __tablename__ = "scheduler_lock"
+
+    id = Column(Integer, primary_key=True)
+    started_at = Column(DateTime, nullable=False)
+    heartbeat_at = Column(DateTime, nullable=False)
+
+
 def _resolve_database_url() -> str:
     return os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 

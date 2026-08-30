@@ -103,6 +103,28 @@ def test_load_secrets_into_environ_is_a_no_op_when_no_secrets_file_exists(mocker
     dashboard_app._load_secrets_into_environ()  # must not raise
 
 
+def test_bootstrap_retries_on_the_next_call_when_run_scheduler_returns_none(mocker):
+    """run_scheduler() returns None when it couldn't claim the
+    cross-process SchedulerLock (agent/models.py) -- e.g. an orphaned
+    process from an earlier reboot still holds it. That must not
+    permanently latch this process out of ever running a scheduler: the
+    lock is heartbeat-based and can go stale, so retrying on the next
+    rerun is what actually lets a live process recover once the orphan
+    is truly gone.
+    """
+    sentinel = MagicMock()
+    mock_run_scheduler = mocker.patch(
+        "dashboard.app.run_scheduler", side_effect=[None, sentinel]
+    )
+
+    first = dashboard_app.bootstrap_agent_loop()
+    second = dashboard_app.bootstrap_agent_loop()
+
+    assert first is None
+    assert second is sentinel
+    assert mock_run_scheduler.call_count == 2
+
+
 def test_bootstrap_guard_holds_under_concurrent_reruns(mocker):
     """Regression-shaped: Streamlit can run multiple sessions' scripts on
     separate threads within the same process, so two sessions could both

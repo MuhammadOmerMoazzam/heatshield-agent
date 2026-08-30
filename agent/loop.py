@@ -17,11 +17,12 @@ from __future__ import annotations
 import argparse
 import logging
 import time as time_module
+from datetime import timedelta
 
 from agent._shared import now_naive_utc
 from agent.decide import decide_and_act
 from agent.fortyguard_client import FortyGuardClient
-from agent.models import Crew, Decision, Reading, Site, db_session
+from agent.models import Crew, Decision, Reading, SchedulerLock, Site, db_session
 from agent.onboarding import onboard_site
 from agent.score import (
     classify_risk_tier,
@@ -46,6 +47,24 @@ DEFAULT_CHECK_CREDITS_EVERY_N_CYCLES = 10
 # alive and updating on its own; reboot the app any time for an
 # immediate fresh cycle on demand (e.g. right before a judge looks).
 DEFAULT_INTERVAL_MINUTES = 360
+
+# Real production bug, live-observed: a single site failed far more times
+# in an ~11-minute window than a true 6-hour-interval scheduler could
+# produce, given each failure took close to the full sense timeout --
+# meaning more than one scheduler was running concurrently against the
+# same credits. dashboard/app.py's in-memory "started once per process"
+# flag can't prevent this: it only knows about its own process, not an
+# orphaned thread left behind by an earlier reboot that Streamlit Cloud
+# didn't fully kill. SchedulerLock (agent/models.py) is a singleton row
+# in the one thing genuinely shared across however many of "these"
+# processes exist -- the database file itself. The heartbeat is a
+# separate, much more frequent job than the sensing cycle itself so a
+# truly dead orphan's lock is detected and reclaimed on the order of
+# minutes, not left stuck until the next 6-hour cycle would have renewed
+# it (or worse, permanently, if a claim were a one-time affair).
+_HEARTBEAT_INTERVAL_MINUTES = 5
+_LOCK_STALE_AFTER = timedelta(minutes=_HEARTBEAT_INTERVAL_MINUTES * 4)
+_SCHEDULER_LOCK_ID = 1
 
 
 def _check_credits(client: FortyGuardClient, credit_floor: int) -> bool:
@@ -228,6 +247,48 @@ def run_once(
         return run_cycle(session, client, skip_onboarding=not credits_ok)
 
 
+def _claim_scheduler_lock(session) -> bool:
+    """True if this caller now holds the singleton SchedulerLock row --
+    either by creating it (no one held it yet) or by stealing it from a
+    stale holder (heartbeat older than _LOCK_STALE_AFTER, i.e. presumed
+    dead). False if a live holder already exists.
+
+    Race-safe the same way agent.seed's demo-site insert is: the
+    fixed-id insert relies on the primary key itself as the uniqueness
+    guard, and a concurrent loser catches the IntegrityError rather than
+    corrupting the row.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    now = now_naive_utc()
+    existing = session.get(SchedulerLock, _SCHEDULER_LOCK_ID)
+    if existing is None:
+        try:
+            with session.begin_nested():
+                session.add(SchedulerLock(id=_SCHEDULER_LOCK_ID, started_at=now, heartbeat_at=now))
+                session.flush()
+        except IntegrityError:
+            return False
+        return True
+
+    if now - existing.heartbeat_at < _LOCK_STALE_AFTER:
+        return False
+
+    existing.started_at = now
+    existing.heartbeat_at = now
+    session.flush()
+    return True
+
+
+def _renew_scheduler_lock(session) -> None:
+    """Refresh this holder's heartbeat so a healthy scheduler is never
+    mistaken for a dead orphan and reclaimed out from under it.
+    """
+    existing = session.get(SchedulerLock, _SCHEDULER_LOCK_ID)
+    if existing is not None:
+        existing.heartbeat_at = now_naive_utc()
+
+
 def run_scheduler(
     *,
     interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
@@ -236,11 +297,26 @@ def run_scheduler(
 ):
     """Start a background APScheduler job running run_cycle() on a fixed
     interval, checking credits at startup and every N cycles thereafter.
+
+    Claims SchedulerLock first (see its docstring and _claim_scheduler_lock
+    above) -- if another live process already holds it, this returns None
+    without starting anything, rather than running a second scheduler
+    concurrently against the same credits.
     """
     if check_credits_every_n_cycles < 1:
         raise ValueError(
             f"check_credits_every_n_cycles must be >= 1, got {check_credits_every_n_cycles!r}"
         )
+
+    with db_session() as session:
+        claimed = _claim_scheduler_lock(session)
+    if not claimed:
+        logger.warning(
+            "SchedulerLock already held by a live process; not starting a competing "
+            "scheduler here. If the real holder is actually dead, this will be "
+            "reclaimed automatically once its heartbeat goes stale."
+        )
+        return None
 
     from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -254,6 +330,10 @@ def run_scheduler(
         with db_session() as session:
             run_cycle(session, client, skip_onboarding=not state["credits_ok"])
 
+    def _heartbeat_job() -> None:
+        with db_session() as session:
+            _renew_scheduler_lock(session)
+
     # timezone="UTC": BackgroundScheduler() with no explicit timezone
     # defaults to the host's local tz (apscheduler/schedulers/base.py),
     # which would localize the naive-UTC now_naive_utc() below as if it
@@ -261,6 +341,7 @@ def run_scheduler(
     # becomes "run several hours late" on any host west of UTC.
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(_job, "interval", minutes=interval_minutes, next_run_time=now_naive_utc())
+    scheduler.add_job(_heartbeat_job, "interval", minutes=_HEARTBEAT_INTERVAL_MINUTES)
     scheduler.start()
     return scheduler
 
@@ -279,6 +360,9 @@ def main() -> None:
         return
 
     scheduler = run_scheduler()
+    if scheduler is None:
+        print("Another process already holds the scheduler lock; exiting without starting one.")
+        return
     try:
         while True:
             time_module.sleep(1)

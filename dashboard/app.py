@@ -95,6 +95,16 @@ def bootstrap_agent_loop():
     successful call. Double-checked locking: the lock is only taken on
     the (rare, first-ever) slow path, so repeated reruns within an
     already-bootstrapped process pay no locking cost.
+
+    run_scheduler() can return None -- it claims a database-backed
+    SchedulerLock (agent/models.py) before actually starting anything,
+    so a second process (e.g. an orphaned thread a Streamlit Cloud
+    reboot didn't fully kill) doesn't run a competing scheduler against
+    the same credits. _scheduler_started is only latched True once a
+    real handle comes back, so a rerun that found the lock held retries
+    on the next rerun rather than giving up on this process forever --
+    the lock is heartbeat-based, so if the real holder is actually dead
+    this eventually succeeds.
     """
     global _scheduler_started, _scheduler_handle
     if _scheduler_started:
@@ -102,7 +112,8 @@ def bootstrap_agent_loop():
     with _bootstrap_lock:
         if not _scheduler_started:
             _scheduler_handle = run_scheduler()
-            _scheduler_started = True
+            if _scheduler_handle is not None:
+                _scheduler_started = True
     return _scheduler_handle
 
 RISK_TIER_COLORS = {
