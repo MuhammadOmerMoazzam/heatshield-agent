@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.fortyguard_client import ForecastWindowError, FortyGuardClient
+from agent.fortyguard_client import ForecastWindowError, FortyGuardClient, TaskTimeoutError
 from agent.models import Site
 from agent.sense import LIVE_LOOKBACK_HOURS, SenseDataUnavailableError, sense_forecast, sense_live
 
@@ -280,6 +280,104 @@ def test_sense_live_and_sense_forecast_use_an_extended_timeout():
     env_call = client.environmental_parameters.call_args
     assert env_call.kwargs.get("timeout") is not None
     assert env_call.kwargs["timeout"] >= 300.0
+
+
+def test_sense_live_temperature_layer_retries_once_on_timeout_then_succeeds():
+    """Live-observed pattern this hackathon: Phoenix and Houston each
+    independently hit a same-cycle TaskTimeoutError on a FortyGuard call,
+    with the identical call often succeeding within seconds on a later
+    attempt -- consistent with transient server-side load, not a
+    systematic failure worth giving up on immediately. 300s is already a
+    generous per-attempt timeout, and this runs in the background
+    scheduler where extra latency costs nothing user-facing, so one retry
+    before giving up is a cheap way to materially improve the odds of a
+    live reading landing each cycle.
+    """
+    client = MagicMock()
+    client.create_heatmap.side_effect = [
+        TaskTimeoutError("Activity abc still 'processing' after timeout"),
+        _heatmap_result(mean_temp_c=35.0),
+    ]
+    client.environmental_parameters.return_value = _env_params_result()
+    site = _make_site()
+
+    reading = sense_live(client, site)
+
+    assert client.create_heatmap.call_count == 2
+    assert reading.heat_index == pytest.approx(38.0 * 9 / 5 + 32)
+
+
+def test_sense_live_temperature_layer_still_raises_when_retry_also_times_out():
+    client = MagicMock()
+    client.create_heatmap.side_effect = [
+        TaskTimeoutError("Activity abc still 'processing' after timeout"),
+        TaskTimeoutError("Activity def still 'processing' after timeout"),
+    ]
+    site = _make_site()
+
+    with pytest.raises(TaskTimeoutError):
+        sense_live(client, site)
+
+    assert client.create_heatmap.call_count == 2
+
+
+def test_sense_live_env_params_retries_once_at_the_same_lookback_hour_then_succeeds():
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(mean_temp_c=35.0)
+    client.environmental_parameters.side_effect = [
+        TaskTimeoutError("Activity abc still 'processing' after timeout"),
+        _env_params_result(),
+    ]
+    site = _make_site()
+
+    reading = sense_live(client, site)
+
+    assert client.environmental_parameters.call_count == 2
+    # Both attempts targeted the same (first) lookback hour -- a retry
+    # isn't a new fallback hour, it's a second try at the same one.
+    first_ts = client.environmental_parameters.call_args_list[0].kwargs["reference_ts"]
+    second_ts = client.environmental_parameters.call_args_list[1].kwargs["reference_ts"]
+    assert first_ts == second_ts
+    assert reading.humidity == 55.0
+
+
+def test_sense_live_env_params_moves_to_next_lookback_hour_after_timeout_and_retry_both_fail():
+    """A timeout is treated the same as the existing "succeeded but
+    empty" case once both the original attempt and its retry are
+    exhausted -- move on to the next fallback hour rather than aborting
+    the whole cycle, mirroring how this loop already degrades gracefully
+    for empty data.
+    """
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result(mean_temp_c=35.0)
+    client.environmental_parameters.side_effect = [
+        TaskTimeoutError("Activity abc still 'processing' after timeout"),
+        TaskTimeoutError("Activity def still 'processing' after timeout"),
+        _env_params_result(),
+    ]
+    site = _make_site()
+
+    reading = sense_live(client, site)
+
+    assert client.environmental_parameters.call_count == 3
+    first_ts = client.environmental_parameters.call_args_list[0].kwargs["reference_ts"]
+    third_ts = client.environmental_parameters.call_args_list[2].kwargs["reference_ts"]
+    assert third_ts == first_ts - timedelta(hours=1)
+    assert reading.humidity == 55.0
+
+
+def test_sense_forecast_retries_once_on_timeout_then_succeeds():
+    client = MagicMock()
+    client.create_heatmap.side_effect = [
+        TaskTimeoutError("Activity abc still 'processing' after timeout"),
+        _heatmap_result(max_temp_c=41.5),
+    ]
+    site = _make_site()
+
+    signal = sense_forecast(client, site)
+
+    assert client.create_heatmap.call_count == 2
+    assert signal.max_temp_c == 41.5
 
 
 def test_sense_forecast_beyond_12h_raises_forecast_window_error():

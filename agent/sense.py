@@ -66,7 +66,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 
 from agent._shared import now_naive_utc as _now_naive_utc
-from agent.fortyguard_client import FortyGuardClient
+from agent.fortyguard_client import FortyGuardClient, TaskTimeoutError
 from agent.models import Site
 
 
@@ -120,6 +120,25 @@ def celsius_to_fahrenheit(celsius: float) -> float:
     return celsius * 9 / 5 + 32
 
 
+def _call_with_one_retry_on_timeout(fn):
+    """A single retry before giving up on a TaskTimeoutError. Live-
+    observed repeatedly this hackathon: Phoenix and Houston each
+    independently hit a same-cycle TaskTimeoutError on a FortyGuard call,
+    with the identical call often succeeding within seconds on a later
+    attempt -- consistent with transient server-side load, not a
+    systematic failure. 300s is already a generous per-attempt timeout,
+    and this runs in the background scheduler where extra latency costs
+    nothing user-facing, so trading a bounded amount of it for materially
+    better odds of a reading landing each cycle is worth it. Still
+    propagates if the retry also times out -- this is one extra chance,
+    not an unbounded loop.
+    """
+    try:
+        return fn()
+    except TaskTimeoutError:
+        return fn()
+
+
 def _fetch_live_temperature(
     client: FortyGuardClient, site: Site, base_now: datetime
 ) -> tuple[float, datetime]:
@@ -136,11 +155,13 @@ def _fetch_live_temperature(
     the collision window with the background scheduler's other writes)
     plus fast, unbounded SQLite file growth.
     """
-    day_response = client.create_heatmap(
-        site.polygon_geojson,
-        start_date=base_now.date().isoformat(),
-        filter_type=3,
-        timeout=_SENSE_TIMEOUT,
+    day_response = _call_with_one_retry_on_timeout(
+        lambda: client.create_heatmap(
+            site.polygon_geojson,
+            start_date=base_now.date().isoformat(),
+            filter_type=3,
+            timeout=_SENSE_TIMEOUT,
+        )
     )
     day_temperature_stats = day_response.get("result", {}).get("stats_data", {}).get(
         "temperature_stats"
@@ -172,13 +193,22 @@ def _fetch_live_environmental_parameters(
     """
     for hours_back in LIVE_LOOKBACK_HOURS:
         candidate_ts = ts - timedelta(hours=hours_back)
-        env_response = client.environmental_parameters(
-            site.lat,
-            site.lon,
-            temperature=mean_temp_c,
-            reference_ts=candidate_ts,
-            timeout=_SENSE_TIMEOUT,
-        )
+        try:
+            env_response = _call_with_one_retry_on_timeout(
+                lambda: client.environmental_parameters(
+                    site.lat,
+                    site.lon,
+                    temperature=mean_temp_c,
+                    reference_ts=candidate_ts,
+                    timeout=_SENSE_TIMEOUT,
+                )
+            )
+        except TaskTimeoutError:
+            # Both the original attempt and its retry timed out at this
+            # specific hour -- treat it the same as the "succeeded but
+            # empty" case below and move on to the next fallback hour,
+            # rather than aborting the whole cycle over one slow instant.
+            continue
         location = env_response["result"]["locations"][0]
         parameters = location["parameters"]
         heat_index_values = parameters.get("heat_index_celsius") or []
@@ -239,19 +269,22 @@ def sense_forecast(
     """
     ts = (now or _now_naive_utc()) + timedelta(hours=12)
 
-    day_response = client.create_heatmap(
-        site.polygon_geojson,
-        start_date=ts.date().isoformat(),
-        filter_type=3,
-        # start_time is otherwise unused for a day-level query (the API
-        # ignores it per the quickstart docs), but keeping it here is
-        # what makes the client's own client-side +12h forecast-window
-        # guard (_validate_forecast_window, which only checks start_time
-        # when one is given) still fire *before* any network call --
-        # without it, an out-of-window forecast request would go
-        # straight to the real API instead of being rejected locally.
-        start_time=ts.strftime("%H:%M"),
-        timeout=_SENSE_TIMEOUT,
+    day_response = _call_with_one_retry_on_timeout(
+        lambda: client.create_heatmap(
+            site.polygon_geojson,
+            start_date=ts.date().isoformat(),
+            filter_type=3,
+            # start_time is otherwise unused for a day-level query (the
+            # API ignores it per the quickstart docs), but keeping it
+            # here is what makes the client's own client-side +12h
+            # forecast-window guard (_validate_forecast_window, which
+            # only checks start_time when one is given) still fire
+            # *before* any network call -- without it, an out-of-window
+            # forecast request would go straight to the real API instead
+            # of being rejected locally.
+            start_time=ts.strftime("%H:%M"),
+            timeout=_SENSE_TIMEOUT,
+        )
     )
     day_temperature_stats = day_response.get("result", {}).get("stats_data", {}).get(
         "temperature_stats"
