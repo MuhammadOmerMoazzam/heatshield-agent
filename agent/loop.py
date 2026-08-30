@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import time as time_module
 from datetime import timedelta
 
@@ -65,6 +66,19 @@ DEFAULT_INTERVAL_MINUTES = 360
 _HEARTBEAT_INTERVAL_MINUTES = 5
 _LOCK_STALE_AFTER = timedelta(minutes=_HEARTBEAT_INTERVAL_MINUTES * 4)
 _SCHEDULER_LOCK_ID = 1
+
+# Real bug, live-observed in production: multiple near-simultaneous
+# Streamlit script reruns from the same fresh boot each called
+# _claim_scheduler_lock concurrently. Unlike agent.seed's demo-site
+# insert, this had no module-level lock serializing the check-then-
+# insert/update region at all -- two callers could both see the lock row
+# as absent (or both see the same stale row) and both write, occasionally
+# surfacing as a raw sqlite3.OperationalError: database is locked instead
+# of being cleanly serialized, or (for the steal-a-stale-lock path, which
+# has no IntegrityError safety net at all since it's an UPDATE) both
+# believing they'd won and starting a second competing scheduler -- the
+# exact failure mode this whole lock exists to prevent.
+_scheduler_lock_claim_lock = threading.Lock()
 
 
 def _check_credits(client: FortyGuardClient, credit_floor: int) -> bool:
@@ -333,28 +347,38 @@ def _claim_scheduler_lock(session) -> bool:
     Race-safe the same way agent.seed's demo-site insert is: the
     fixed-id insert relies on the primary key itself as the uniqueness
     guard, and a concurrent loser catches the IntegrityError rather than
-    corrupting the row.
+    corrupting the row. _scheduler_lock_claim_lock additionally
+    serializes same-process callers (see its own comment) and this
+    function commits before returning, so a claim is fully durable and
+    visible to any other caller before the lock is released -- mirroring
+    the fix applied to agent.seed.seed_demo_sites_if_empty for the exact
+    same class of bug.
     """
     from sqlalchemy.exc import IntegrityError
 
-    now = now_naive_utc()
-    existing = session.get(SchedulerLock, _SCHEDULER_LOCK_ID)
-    if existing is None:
-        try:
-            with session.begin_nested():
-                session.add(SchedulerLock(id=_SCHEDULER_LOCK_ID, started_at=now, heartbeat_at=now))
-                session.flush()
-        except IntegrityError:
+    with _scheduler_lock_claim_lock:
+        now = now_naive_utc()
+        existing = session.get(SchedulerLock, _SCHEDULER_LOCK_ID)
+        if existing is None:
+            try:
+                with session.begin_nested():
+                    session.add(
+                        SchedulerLock(id=_SCHEDULER_LOCK_ID, started_at=now, heartbeat_at=now)
+                    )
+                    session.flush()
+                session.commit()
+            except IntegrityError:
+                return False
+            return True
+
+        if now - existing.heartbeat_at < _LOCK_STALE_AFTER:
             return False
+
+        existing.started_at = now
+        existing.heartbeat_at = now
+        session.flush()
+        session.commit()
         return True
-
-    if now - existing.heartbeat_at < _LOCK_STALE_AFTER:
-        return False
-
-    existing.started_at = now
-    existing.heartbeat_at = now
-    session.flush()
-    return True
 
 
 def _renew_scheduler_lock(session) -> None:

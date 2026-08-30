@@ -15,6 +15,7 @@ still be reclaimed later rather than permanently bricking the scheduler.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from unittest.mock import MagicMock
 
@@ -56,6 +57,53 @@ def test_claim_scheduler_lock_succeeds_when_the_existing_lock_is_stale(tmp_path)
         assert _claim_scheduler_lock(session) is True
         lock = session.query(SchedulerLock).one()
         assert lock.heartbeat_at > stale_time
+
+
+def test_claim_scheduler_lock_commits_before_returning_so_a_concurrent_reader_sees_it(
+    tmp_path,
+):
+    """Real bug, live-observed in production (multiple near-simultaneous
+    Streamlit script reruns from the same fresh boot racing to claim
+    SchedulerLock): unlike agent.seed's demo-site insert, this function
+    had no module-level lock serializing its check-then-insert region at
+    all, and relied entirely on the *caller's* eventual db_session()
+    commit to make a claim durable -- leaving a window where a second,
+    concurrent claimant's own lookup could see the row as still absent
+    and also try to insert, surfacing as a raw
+    sqlite3.OperationalError: database is locked instead of the
+    IntegrityError safety net this function already handles (the exact
+    same class of bug just fixed in agent.seed.seed_demo_sites_if_empty).
+    """
+    database_url = f"sqlite:///{tmp_path / 't.db'}"
+
+    with db_session(database_url) as session:
+        assert _claim_scheduler_lock(session) is True
+
+        with db_session(database_url) as other_session:
+            assert other_session.query(SchedulerLock).count() == 1
+
+
+def test_claim_scheduler_lock_under_concurrent_calls_exactly_one_wins(tmp_path):
+    """Live-observed real bug: multiple near-simultaneous Streamlit script
+    reruns from the same fresh boot each called this concurrently against
+    an empty database. Mirrors
+    test_seed.test_seed_demo_sites_if_empty_does_not_duplicate_under_concurrent_calls
+    for the same reason -- this is the exact shape of race that produced
+    it live.
+    """
+    database_url = f"sqlite:///{tmp_path / 't.db'}"
+
+    def _claim_once(_: int) -> bool:
+        with db_session(database_url) as session:
+            return _claim_scheduler_lock(session)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(_claim_once, range(8)))
+
+    assert results.count(True) == 1
+
+    with db_session(database_url) as session:
+        assert session.query(SchedulerLock).count() == 1
 
 
 def test_renew_scheduler_lock_updates_heartbeat(tmp_path):
