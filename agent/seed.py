@@ -121,6 +121,17 @@ def seed_demo_sites_if_empty(session) -> int:
     Site.name's UNIQUE constraint (agent/models.py) for why a duplicate
     insert from a concurrent caller is caught and treated as "already
     seeded" rather than raising.
+
+    Real bug, live-observed on CI (Python 3.11, intermittent): _seed_lock
+    only serializes the check-then-insert-then-flush region below, not
+    the actual commit -- which, per this codebase's db_session()
+    contract, normally happens afterward in the *caller's* `with
+    db_session(...)` block, after this function has already returned and
+    released the lock. That left a real window where a second thread
+    could acquire the lock, see the still-uncommitted table as empty, and
+    also try to insert -- occasionally surfacing as a raw "database is
+    locked" error instead of the IntegrityError safety net below.
+    Committing here, before releasing the lock, closes that window.
     """
     with _seed_lock:
         if session.query(Site).first() is not None:
@@ -141,6 +152,7 @@ def seed_demo_sites_if_empty(session) -> int:
                     session.flush()
                     session.add(Crew(site_id=site.id, **spec["crew"]))
                 session.flush()
+            session.commit()
         except IntegrityError:
             # A concurrent caller won the race and already committed
             # these sites (by name) between our check above and this

@@ -76,3 +76,30 @@ def test_seed_demo_sites_if_empty_does_not_duplicate_under_concurrent_calls(tmp_
 
     assert len(names) == len(_DEMO_SITES)
     assert len(names) == len(set(names))
+
+
+def test_seed_demo_sites_if_empty_commits_before_returning_so_a_concurrent_reader_sees_it(
+    tmp_path,
+):
+    """Real bug, live-observed on CI (Python 3.11, not reproducible every
+    run): the module-level lock above only serializes the check-then-
+    insert-then-flush region -- it's released the instant
+    seed_demo_sites_if_empty() returns. The actual commit, per this
+    codebase's db_session() contract, only happens afterward, in the
+    *caller's* `with db_session(...)` block. That leaves a real window
+    where a second thread can acquire the lock, see the still-uncommitted
+    table as empty, and also try to insert -- occasionally surfacing as a
+    raw sqlite3.OperationalError: database is locked instead of the
+    IntegrityError safety net this function already handles. Committing
+    before releasing the lock closes that window: by the time any other
+    caller can even start its own check, this thread's insert is already
+    durable and visible to a totally independent connection.
+    """
+    database_url = f"sqlite:///{tmp_path / 't.db'}"
+
+    with db_session(database_url) as session:
+        created = seed_demo_sites_if_empty(session)
+        assert created == len(_DEMO_SITES)
+
+        with db_session(database_url) as other_session:
+            assert other_session.query(Site).count() == len(_DEMO_SITES)
