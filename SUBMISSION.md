@@ -1,6 +1,6 @@
 # HeatShield Agent — Submission Summary
 
-Slack alerts workspace: https://join.slack.com/t/your-workspace-name/shared_invite/your-invite-code — join to see live heat-risk alerts as the agent sends them.
+Slack alerts workspace: https://join.slack.com/t/heatshield/shared_invite/zt-48bp2635i-NX7zlSiVSIKKySzbwMvxMQ — join to see live heat-risk alerts as the agent sends them.
 
 ## Problem
 
