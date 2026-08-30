@@ -7,6 +7,7 @@ project's audit log -- every action the agent takes writes one.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from contextlib import contextmanager
@@ -29,6 +30,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from agent._shared import REPO_ROOT, now_naive_utc
+
+logger = logging.getLogger(__name__)
 
 # So DATABASE_URL from .env is actually picked up, not just documented in
 # .env.example -- load_dotenv() only sets keys not already in os.environ,
@@ -179,14 +182,70 @@ def _configure_sqlite_for_concurrent_access(engine) -> None:
     WAL mode allows concurrent readers alongside a writer; busy_timeout
     makes a connection retry for a while before raising, rather than
     failing immediately on the first collision.
+
+    Also disables pysqlite's own legacy transaction handling (isolation_
+    level=None) and takes over BEGIN ourselves. Second real bug, code-
+    review-caught and empirically reproduced: without this, pysqlite
+    implicitly commits on RELEASE SAVEPOINT instead of deferring to
+    whatever transaction is still open around it -- every begin_nested()
+    call site in this codebase (agent/loop.py's onboarding/per-site/
+    forecast SAVEPOINTs, agent/seed.py's insert SAVEPOINT) assumes a
+    SAVEPOINT that exits cleanly is still undoable by a *later* failure
+    in the same db_session() block, which silently wasn't true. This is
+    SQLAlchemy's own documented pysqlite workaround (see "Serializable
+    isolation / Savepoints / Transactional DDL" in the sqlite dialect
+    docs), not a local invention.
     """
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
+        dbapi_connection.isolation_level = None
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
+
+    @event.listens_for(engine, "begin")
+    def _sqlite_begin(conn):
+        conn.exec_driver_sql("BEGIN")
+
+
+def _backfill_sites_name_unique_index(engine) -> None:
+    """Code-review-caught: Site.name's unique=True (added this session to
+    fix a live duplicate-site bug) is only enforced by
+    Base.metadata.create_all() below, which creates *missing* tables but
+    never alters an already-existing one -- so a persisted heatshield.db
+    predating this constraint would silently keep allowing duplicate
+    site names forever, with that fix never actually taking effect on
+    that specific database file. Streamlit Cloud's filesystem has been
+    directly observed (not just theoretical) to survive at least some
+    reboots this session, so this isn't a hypothetical case.
+
+    A standalone UNIQUE INDEX enforces the same guarantee as a UNIQUE
+    column constraint without needing SQLite's full rebuild-the-table
+    ALTER TABLE dance -- CREATE UNIQUE INDEX works against an
+    already-populated table exactly like create_all() works against a
+    missing one. If duplicate-named rows already exist on this specific
+    database (e.g. from before this session's seeding-race fix), the
+    index creation itself fails -- logged, not raised, since crashing
+    the whole app on boot over data dashboard/app.py's own
+    _dedupe_sites_by_name already papers over would be a worse outcome
+    than the status quo.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_sites_name_unique ON sites(name)"
+            )
+    except Exception:
+        logger.warning(
+            "Could not create a unique index on sites.name -- this database file "
+            "likely already has duplicate-named rows predating this session's "
+            "duplicate-site fix. New-insert protection is degraded until those "
+            "are cleaned up by hand; dashboard/app.py's own dedupe-by-name still "
+            "keeps the dashboard itself correct in the meantime.",
+            exc_info=True,
+        )
 
 
 def _get_session_factory(database_url: str) -> sessionmaker:
@@ -208,6 +267,8 @@ def _get_session_factory(database_url: str) -> sessionmaker:
             if url_obj.get_backend_name() == "sqlite":
                 _configure_sqlite_for_concurrent_access(engine)
             Base.metadata.create_all(engine)
+            if url_obj.get_backend_name() == "sqlite":
+                _backfill_sites_name_unique_index(engine)
             # expire_on_commit=False: db_session() closes its session
             # immediately after commit (see below), and callers like
             # agent.loop.run_once() return ORM rows straight out of that

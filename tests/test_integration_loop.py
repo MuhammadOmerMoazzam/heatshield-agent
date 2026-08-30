@@ -15,7 +15,7 @@ import pytest
 
 from agent.fortyguard_client import TaskFailedError
 from agent.loop import _check_credits, run_cycle, run_once, run_scheduler
-from agent.models import Crew, Reading, Score, Site, db_session
+from agent.models import Crew, Decision, Reading, Score, Site, db_session
 from agent.sense import sense_live
 
 HOUSTON_POLYGON = {
@@ -390,6 +390,64 @@ def test_sense_flush_failure_for_one_site_does_not_poison_the_rest_of_the_cycle(
             assert reading_row.site_id == site2.id
 
 
+def test_one_crews_failure_does_not_erase_another_crews_already_written_live_decision(
+    tmp_path, mocker
+):
+    """Code-review regression, empirically reproduced: unlike the forecast
+    branch, the live branch's per-crew loop had no SAVEPOINT/try-except
+    isolation of its own -- only the outer per-site one from run_cycle
+    covered the whole branch. A later crew's decide_and_act failure would
+    silently roll back an earlier crew's already-flushed Score/Decision
+    rows too, so a real side effect already sent for that earlier crew
+    (a Slack alert, a compliance report) would end up corresponding to no
+    Decision row at all -- breaking decide.py's own documented "the
+    Decision row still gets written, reflecting what actually happened"
+    guarantee.
+    """
+    mocker.patch("agent.act.notify.notify_slack")
+    mocker.patch("agent.act.schedule.write_shift_override")
+    mocker.patch("agent.act.compliance_report.generate_compliance_report")
+
+    client = MagicMock()
+    client.create_heatmap.return_value = _heatmap_result()
+    client.environmental_parameters.return_value = _env_params_result()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site, crew1 = _seed(session)
+        crew1_id = crew1.id
+        crew2 = Crew(
+            site_id=site.id,
+            work_intensity="heavy",
+            ppe_class="Class 2",
+            active_shift_start=time(6, 0),
+            active_shift_end=time(14, 0),
+        )
+        session.add(crew2)
+        session.flush()
+        crew2_id = crew2.id
+
+        from agent.decide import decide_and_act as real_decide_and_act
+
+        def _fail_second_crew_live(session_, client_, site_, crew, reading, score, tier, trigger_type):
+            if crew.id == crew2_id and trigger_type == "live":
+                raise RuntimeError("simulated decide_and_act failure for crew 2")
+            return real_decide_and_act(session_, client_, site_, crew, reading, score, tier, trigger_type)
+
+        mocker.patch("agent.loop.decide_and_act", side_effect=_fail_second_crew_live)
+
+        run_cycle(session, client, skip_onboarding=True)
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        live_decisions = [d for d in session.query(Decision).all() if d.trigger_type == "live"]
+        crew_ids_with_a_live_decision = {
+            session.get(Score, d.score_id).crew_id for d in live_decisions
+        }
+        # Crew 1's live decision must survive as a real, queryable row --
+        # not just live in a Python list this test never even sees --
+        # despite crew 2's failure in the very same loop.
+        assert crew1_id in crew_ids_with_a_live_decision
+
+
 def test_forecast_sensing_failure_still_returns_live_branch_decisions(tmp_path, mocker):
     """Code-review regression: sense_forecast raising after the live branch
     already succeeded used to propagate out of _run_site_cycle before its
@@ -473,13 +531,20 @@ def test_run_scheduler_rejects_zero_check_credits_every_n_cycles():
         run_scheduler(check_credits_every_n_cycles=0)
 
 
-def test_run_scheduler_uses_utc_timezone(mocker):
+def test_run_scheduler_uses_utc_timezone(mocker, monkeypatch, tmp_path):
     """Code-review regression: BackgroundScheduler() with no explicit
     timezone defaults to the host's local timezone, so the naive-UTC
     now_naive_utc() passed as next_run_time gets localized as local time
     instead of UTC -- on a host west of UTC, "run immediately at startup"
     silently turns into "run several hours late".
+
+    Isolated DATABASE_URL like every other test here (not the default
+    local dev DB): run_scheduler() now claims a cross-process
+    SchedulerLock row (agent/models.py) before starting anything, and a
+    shared, unisolated DB file could carry lock state left over from a
+    previous test/run, incidentally blocking this one.
     """
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 't.db'}")
     mock_scheduler_cls = mocker.patch("apscheduler.schedulers.background.BackgroundScheduler")
     mocker.patch("agent.loop.FortyGuardClient")
 

@@ -4,10 +4,12 @@ regression test for the session-factory cache's first-use race.
 
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from agent.models import Crew, Decision, Reading, Score, Site, db_session
 
@@ -202,6 +204,120 @@ def test_sqlite_engine_uses_wal_mode_and_a_busy_timeout(tmp_path):
 
     assert journal_mode.lower() == "wal"
     assert busy_timeout_ms >= 10_000
+
+
+def test_rolling_back_a_session_undoes_savepoints_already_released_within_it(tmp_path):
+    """Real bug, code-review-caught and empirically reproduced: pysqlite's
+    legacy (default) transaction handling implicitly commits when a
+    RELEASE SAVEPOINT is issued instead of deferring to the enclosing
+    transaction, so a SAVEPOINT that already exited cleanly (e.g.
+    agent.loop.run_cycle's per-site `with session.begin_nested():`) was
+    durably written to disk immediately -- even though every one of those
+    call sites' own comments assert "nothing commits until db_session()'s
+    single commit at the very end." A later, unrelated failure in the
+    same db_session() block must still be able to undo everything,
+    including work from savepoints that already released successfully --
+    that's the entire reason those call sites use begin_nested() instead
+    of committing directly.
+    """
+    database_url = f"sqlite:///{tmp_path / 'savepoint_rollback.db'}"
+
+    try:
+        with db_session(database_url) as session:
+            with session.begin_nested():
+                session.add(
+                    Site(
+                        name="A",
+                        lat=0.0,
+                        lon=0.0,
+                        polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+                    )
+                )
+                session.flush()
+            with session.begin_nested():
+                session.add(
+                    Site(
+                        name="B",
+                        lat=0.0,
+                        lon=0.0,
+                        polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+                    )
+                )
+                session.flush()
+            raise RuntimeError("simulated later failure outside any savepoint")
+    except RuntimeError:
+        pass
+
+    with db_session(database_url) as session:
+        assert session.query(Site).count() == 0
+
+
+def test_pre_existing_database_gets_a_unique_index_backfilled_onto_sites_name(tmp_path):
+    """Code-review-caught: Site.name's unique=True (added this session to
+    fix a live duplicate-site bug) is only enforced by
+    Base.metadata.create_all(), which creates *missing* tables but never
+    alters an already-existing one -- so a persisted heatshield.db that
+    predates this constraint (Streamlit Cloud's filesystem has been
+    directly observed to survive at least some reboots this session, not
+    just theoretically) would silently keep allowing duplicate site
+    names forever, with the duplicate-site fix never actually taking
+    effect on that specific database file.
+
+    Simulates that exact pre-existing database (a bare `sites` table
+    created without the unique constraint, the shape any deployment from
+    before this session's Phase 9 duplicate-site fix would have) and
+    confirms opening it through db_session() backfills a real,
+    enforced unique index -- not just a fresh from create_all() table.
+    """
+    db_path = tmp_path / "pre_existing.db"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute(
+        """
+        CREATE TABLE sites (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            lat FLOAT NOT NULL,
+            lon FLOAT NOT NULL,
+            polygon_geojson TEXT NOT NULL,
+            shade_coverage_pct FLOAT,
+            canopy_pct FLOAT,
+            created_at DATETIME NOT NULL,
+            satellite_image_path VARCHAR,
+            satellite_legend TEXT,
+            streetview_image_path VARCHAR,
+            streetview_legend TEXT
+        )
+        """
+    )
+    raw_conn.commit()
+    raw_conn.close()
+
+    database_url = f"sqlite:///{db_path}"
+    with db_session(database_url) as session:
+        session.add(
+            Site(
+                name="Duplicate Name",
+                lat=0.0,
+                lon=0.0,
+                polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+            )
+        )
+
+    raised = False
+    try:
+        with db_session(database_url) as session:
+            session.add(
+                Site(
+                    name="Duplicate Name",
+                    lat=1.0,
+                    lon=1.0,
+                    polygon_geojson={"type": "Polygon", "coordinates": [[[1, 1]]]},
+                )
+            )
+    except IntegrityError:
+        raised = True
+
+    assert raised, "sites.name should be enforced unique even on a pre-existing database"
 
 
 def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):

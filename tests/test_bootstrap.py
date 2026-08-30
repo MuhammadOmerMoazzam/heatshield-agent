@@ -125,6 +125,23 @@ def test_bootstrap_retries_on_the_next_call_when_run_scheduler_returns_none(mock
     assert mock_run_scheduler.call_count == 2
 
 
+def test_bootstrap_does_not_crash_the_dashboard_when_run_scheduler_raises(mocker):
+    """Code-review regression: run_scheduler() can raise before ever
+    returning (e.g. FortyGuardClient() raising FortyGuardError on a
+    missing/invalid FORTYGUARD_API_KEY -- a real scenario this project
+    hit live this session). main() has no try/except of its own around
+    bootstrap_agent_loop(), so an uncaught exception here used to crash
+    the entire dashboard render on every single rerun -- not even the
+    already-seeded site data would show. A misconfigured key should
+    degrade to "no scheduler yet", not take the whole dashboard down.
+    """
+    mocker.patch("dashboard.app.run_scheduler", side_effect=RuntimeError("no API key"))
+
+    result = dashboard_app.bootstrap_agent_loop()  # must not raise
+
+    assert result is None
+
+
 def test_bootstrap_guard_holds_under_concurrent_reruns(mocker):
     """Regression-shaped: Streamlit can run multiple sessions' scripts on
     separate threads within the same process, so two sessions could both

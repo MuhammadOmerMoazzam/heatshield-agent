@@ -158,16 +158,37 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
     session.add(reading)
     session.flush()
 
+    # Each crew gets its own SAVEPOINT + try/except: code-review-caught,
+    # empirically reproduced regression -- with only the outer per-site
+    # SAVEPOINT (in run_cycle) covering this whole loop, one crew's
+    # decide_and_act failure rolled back *every* crew's already-flushed
+    # Score/Decision rows for this reading, not just its own. That broke
+    # decide.py's own documented guarantee that a real side effect
+    # already sent (a Slack alert, a compliance report) always has a
+    # corresponding Decision row -- an earlier crew's real alert would
+    # end up matched to no row at all. Same SAVEPOINT reasoning as
+    # run_cycle's per-site isolation, just scoped one level deeper.
     for crew in crews:
-        raw_stress = compute_raw_stress(
-            reading.heat_index, reading.humidity, reading.solar_irradiance
-        )
-        modifier = compute_exposure_modifier(site.shade_coverage_pct, crew.work_intensity)
-        final_score = compute_final_score(raw_stress, modifier)
-        tier = classify_risk_tier(final_score)
-        decisions.append(
-            decide_and_act(session, client, site, crew, reading, final_score, tier, "live")
-        )
+        try:
+            with session.begin_nested():
+                raw_stress = compute_raw_stress(
+                    reading.heat_index, reading.humidity, reading.solar_irradiance
+                )
+                modifier = compute_exposure_modifier(site.shade_coverage_pct, crew.work_intensity)
+                final_score = compute_final_score(raw_stress, modifier)
+                tier = classify_risk_tier(final_score)
+                decision = decide_and_act(
+                    session, client, site, crew, reading, final_score, tier, "live"
+                )
+            decisions.append(decision)
+        except Exception:
+            logger.exception(
+                "Live decide/act failed for crew_id=%s at site_id=%s (%s); other crews at "
+                "this site still processed.",
+                crew.id,
+                site.id,
+                site.name,
+            )
 
     # Forecast (proactive) branch -- heatmap only, no env_params call
     # (Rule 2 / Phase 5), so there's no humidity/solar signal to run
@@ -182,6 +203,9 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
     # session.rollback() here would undo the live branch's work too,
     # since both branches share this same uncommitted transaction; a
     # SAVEPOINT scopes the rollback to just the forecast branch.
+    forecast_reading = None
+    forecast_temp_f = None
+    forecast_tier = None
     try:
         with session.begin_nested():
             forecast_signal = sense_forecast(client, site)
@@ -202,11 +226,24 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
             )
             session.add(forecast_reading)
             session.flush()
-
             forecast_tier = classify_risk_tier(forecast_temp_f)
-            for crew in crews:
-                decisions.append(
-                    decide_and_act(
+    except Exception:
+        logger.exception(
+            "Forecast sensing/scoring failed for site_id=%s (%s); live-branch decisions for "
+            "this site are still returned.",
+            site.id,
+            site.name,
+        )
+
+    # Same per-crew isolation as the live branch above, and for the same
+    # reason -- a SAVEPOINT around the whole crew loop (the original
+    # shape here) let one crew's failure erase an earlier crew's
+    # already-flushed forecast Decision too.
+    if forecast_reading is not None:
+        for crew in crews:
+            try:
+                with session.begin_nested():
+                    decision = decide_and_act(
                         session,
                         client,
                         site,
@@ -216,14 +253,15 @@ def _run_site_cycle(session, client: FortyGuardClient, site: Site, crews: list[C
                         forecast_tier,
                         "forecast",
                     )
+                decisions.append(decision)
+            except Exception:
+                logger.exception(
+                    "Forecast decide/act failed for crew_id=%s at site_id=%s (%s); other "
+                    "crews at this site still processed.",
+                    crew.id,
+                    site.id,
+                    site.name,
                 )
-    except Exception:
-        logger.exception(
-            "Forecast sensing/scoring failed for site_id=%s (%s); live-branch decisions for "
-            "this site are still returned.",
-            site.id,
-            site.name,
-        )
 
     return decisions
 

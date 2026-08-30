@@ -29,6 +29,7 @@ needed ("once per process," not "once per session").
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -53,6 +54,8 @@ import streamlit as st
 from agent.loop import run_scheduler
 from agent.models import Decision, Reading, Score, Site, db_session
 from agent.seed import seed_demo_sites_if_empty
+
+logger = logging.getLogger(__name__)
 
 _bootstrap_lock = threading.Lock()
 _scheduler_started = False
@@ -105,13 +108,29 @@ def bootstrap_agent_loop():
     on the next rerun rather than giving up on this process forever --
     the lock is heartbeat-based, so if the real holder is actually dead
     this eventually succeeds.
+
+    run_scheduler() can also *raise* outright -- e.g. FortyGuardClient()
+    rejecting a missing/invalid FORTYGUARD_API_KEY, a real scenario this
+    project hit live. Code-review-caught: main() has no try/except of
+    its own around this call, so an uncaught exception here used to
+    crash the entire dashboard render on every rerun, hiding even the
+    already-seeded site data that doesn't depend on the scheduler at
+    all. Caught and logged here instead -- a misconfigured key means "no
+    scheduler yet", not "no dashboard".
     """
     global _scheduler_started, _scheduler_handle
     if _scheduler_started:
         return _scheduler_handle
     with _bootstrap_lock:
         if not _scheduler_started:
-            _scheduler_handle = run_scheduler()
+            try:
+                _scheduler_handle = run_scheduler()
+            except Exception:
+                logger.exception(
+                    "run_scheduler() failed to start; dashboard will still render "
+                    "from whatever's already in the database."
+                )
+                _scheduler_handle = None
             if _scheduler_handle is not None:
                 _scheduler_started = True
     return _scheduler_handle
