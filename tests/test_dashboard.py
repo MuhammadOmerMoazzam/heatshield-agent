@@ -39,6 +39,26 @@ def test_dedupe_sites_by_name_prefers_the_entry_with_data():
     assert phoenix["id"] == 2
 
 
+def test_worst_risk_tier_picks_the_most_severe_among_multiple_crews():
+    """The map marker is only as reassuring as its riskiest crew -- a
+    site with one safe crew and one high-risk crew must show high, not
+    an average or the first crew found.
+    """
+    crew_scores = [
+        {"crew_id": 1, "final_score": 80.0, "risk_tier": "safe"},
+        {"crew_id": 2, "final_score": 110.0, "risk_tier": "high"},
+    ]
+    assert dashboard_app._worst_risk_tier(crew_scores) == "high"
+
+
+def test_worst_risk_tier_is_none_when_no_crew_scores_yet():
+    assert dashboard_app._worst_risk_tier([]) is None
+
+
+def test_hex_to_rgb_converts_a_risk_tier_hex_color():
+    assert dashboard_app._hex_to_rgb("#2e7d32") == [46, 125, 50]
+
+
 def test_dashboard_render_functions_never_call_fortyguard_directly():
     source = inspect.getsource(dashboard_app)
     tree = ast.parse(source)

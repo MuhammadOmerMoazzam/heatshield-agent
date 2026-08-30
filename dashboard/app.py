@@ -142,6 +142,8 @@ RISK_TIER_COLORS = {
     "extreme": "#c62828",
 }
 
+_TIER_SEVERITY = {"safe": 0, "caution": 1, "high": 2, "extreme": 3}
+
 
 def query_site_dashboard_data(session) -> list[dict]:
     """One dict per site: latest live + forecast reading, per-crew scores
@@ -265,54 +267,54 @@ def render_legend(legend: dict | None) -> None:
     st.markdown(f"<div style='font-size:0.8em'>{swatches}</div>", unsafe_allow_html=True)
 
 
-def render_heatmap_panel(heatmap_geojson: dict | None) -> None:
-    """Colors each tile by its own temperature and renders the tile
-    FeatureCollection a heatmap call already returns (Phase 8) -- pydeck
-    ships with streamlit itself, no extra dependency needed.
+def _worst_risk_tier(crew_scores: list[dict]) -> str | None:
+    """The single most severe risk tier among a site's crews, for the
+    at-a-glance map marker -- a site is only as safe as its highest-risk
+    crew. None if there's no live reading yet to score.
     """
-    features = (heatmap_geojson or {}).get("features") or []
-    temps = [
-        f["properties"]["temperature"]
-        for f in features
-        if f.get("properties", {}).get("temperature") is not None
-    ]
-    if not temps:
-        st.caption("No heatmap tile data available for this reading yet.")
+    if not crew_scores:
+        return None
+    return max(crew_scores, key=lambda cs: _TIER_SEVERITY.get(cs["risk_tier"], -1))["risk_tier"]
+
+
+def _hex_to_rgb(hex_color: str) -> list[int]:
+    hex_color = hex_color.lstrip("#")
+    return [int(hex_color[i : i + 2], 16) for i in (0, 2, 4)]
+
+
+def render_risk_marker_map(site_data: dict) -> None:
+    """A small map marker at the site's own coordinates, colored by its
+    current worst-crew risk tier.
+
+    Replaces the old raw heatmap-tile panel: sense.py deliberately never
+    persists a heatmap call's own tile GeoJSON any more (1MB+ per
+    reading, directly implicated in a real "database is locked"
+    production bug -- see agent/sense.py's module docstring), so that
+    panel always showed "not available yet" on every single reading,
+    forever -- reading as an unfinished feature to a judge rather than
+    the intentional tradeoff it is. This uses only data already queried
+    for the rest of the panel (the site's own lat/lon and its latest
+    scores) -- no additional FortyGuard credits spent.
+    """
+    tier = _worst_risk_tier(site_data["crew_scores"])
+    if tier is None:
+        st.caption("No live reading yet.")
         return
 
     import pydeck as pdk
 
-    lo, hi = min(temps), max(temps)
-    colored_features = []
-    for feature in features:
-        temp = feature.get("properties", {}).get("temperature")
-        if temp is None or not feature.get("geometry"):
-            continue
-        frac = 0.5 if hi == lo else (temp - lo) / (hi - lo)
-        colored_features.append(
-            {
-                **feature,
-                "properties": {
-                    **feature["properties"],
-                    "fill_color": [int(255 * frac), 60, int(255 * (1 - frac)), 180],
-                },
-            }
-        )
-    if not colored_features:
-        st.caption("Heatmap tiles present but have no geometry to render.")
-        return
-
-    first_ring = colored_features[0]["geometry"]["coordinates"][0]
-    first_point = first_ring[0] if isinstance(first_ring[0], list) else first_ring
     layer = pdk.Layer(
-        "GeoJsonLayer",
-        {"type": "FeatureCollection", "features": colored_features},
-        get_fill_color="properties.fill_color",
-        stroked=False,
+        "ScatterplotLayer",
+        [{"position": [site_data["lon"], site_data["lat"]]}],
+        get_position="position",
+        get_fill_color=_hex_to_rgb(RISK_TIER_COLORS.get(tier, "#616161")),
+        get_radius=800,
         pickable=True,
     )
-    view_state = pdk.ViewState(longitude=first_point[0], latitude=first_point[1], zoom=13)
-    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, map_style=None))
+    view_state = pdk.ViewState(longitude=site_data["lon"], latitude=site_data["lat"], zoom=11)
+    st.pydeck_chart(
+        pdk.Deck(layers=[layer], initial_view_state=view_state, map_style="light"), height=220
+    )
 
 
 def render_segmentation_images(site_data: dict) -> None:
@@ -359,7 +361,7 @@ def render_site_panel(site_data: dict) -> None:
             f"{forecast_hi:.1f}" if forecast_hi is not None else "n/a",
         )
     with map_col:
-        render_heatmap_panel(site_data["latest_live_heatmap_geojson"])
+        render_risk_marker_map(site_data)
 
     render_segmentation_images(site_data)
 
