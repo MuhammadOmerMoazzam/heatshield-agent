@@ -80,6 +80,18 @@ class Site(Base):
     satellite_legend = Column(JSON, nullable=True)
     streetview_image_path = Column(String, nullable=True)
     streetview_legend = Column(JSON, nullable=True)
+    # Real bug, live-observed: agent.onboarding.onboard_site() used to key
+    # its "already onboarded" check off shade_coverage_pct being non-NULL
+    # -- but agent.seed.py deliberately pre-fills that same column with a
+    # placeholder estimate (to avoid spending Premium credits on the very
+    # first boot before anyone can review it), so a seeded demo site was
+    # indistinguishable from a genuinely onboarded one and real
+    # satellite/streetview segmentation never ran for it, confirmed live
+    # via FortyGuard's own usage breakdown showing zero segmentation calls
+    # ever billed. onboarded_at is set only by a real, successful
+    # onboard_site() call (never by seeding), so it's the one unambiguous
+    # signal of "has this site actually been onboarded".
+    onboarded_at = Column(DateTime, nullable=True)
 
 
 class Crew(Base):
@@ -248,6 +260,32 @@ def _backfill_sites_name_unique_index(engine) -> None:
         )
 
 
+def _backfill_sites_onboarded_at_column(engine) -> None:
+    """Real bug, live-observed: Site.onboarded_at (added to fix the
+    seeded-demo-site-never-really-onboarded bug -- see Site.onboarded_at's
+    own comment) is only added by Base.metadata.create_all() below, which
+    creates *missing* tables but never alters an already-existing one --
+    so a persisted heatshield.db predating this column would raise
+    "no such column: sites.onboarded_at" on every single query the moment
+    this module's Site model expects it to exist. Unlike the sites.name
+    UNIQUE constraint above, a plain nullable column with no default is
+    exactly what SQLite's own ALTER TABLE ADD COLUMN supports directly --
+    no full-table-rebuild workaround needed here.
+    """
+    try:
+        with engine.begin() as conn:
+            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(sites)").fetchall()}
+            if "onboarded_at" not in columns:
+                conn.exec_driver_sql("ALTER TABLE sites ADD COLUMN onboarded_at DATETIME")
+    except Exception:
+        logger.warning(
+            "Could not backfill sites.onboarded_at onto an existing database -- "
+            "onboarding may re-run for sites that already have it if this "
+            "column genuinely couldn't be added.",
+            exc_info=True,
+        )
+
+
 def _get_session_factory(database_url: str) -> sessionmaker:
     # Fast path: no lock needed once a URL is cached. Double-checked
     # locking on the slow path -- without it, concurrent first-time calls
@@ -269,6 +307,7 @@ def _get_session_factory(database_url: str) -> sessionmaker:
             Base.metadata.create_all(engine)
             if url_obj.get_backend_name() == "sqlite":
                 _backfill_sites_name_unique_index(engine)
+                _backfill_sites_onboarded_at_column(engine)
             # expire_on_commit=False: db_session() closes its session
             # immediately after commit (see below), and callers like
             # agent.loop.run_once() return ORM rows straight out of that

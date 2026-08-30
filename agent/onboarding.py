@@ -40,7 +40,7 @@ import base64
 from datetime import date
 from pathlib import Path
 
-from agent._shared import REPO_ROOT
+from agent._shared import REPO_ROOT, now_naive_utc
 from agent.fortyguard_client import FortyGuardClient
 from agent.models import Site
 
@@ -92,10 +92,17 @@ def onboard_site(
 ) -> Site:
     """Onboard ``site``: fetch satellite + street-view segmentation exactly
     once, derive ``shade_coverage_pct``/``canopy_pct``, and write them onto
-    the row. A no-op if the site already has shade data, unless
+    the row. A no-op if the site has already been onboarded, unless
     ``force=True``.
+
+    Real bug, live-observed: this used to check ``shade_coverage_pct is
+    not None`` as its "already onboarded" signal, but agent.seed.py
+    deliberately pre-fills that same column with a placeholder estimate --
+    so every seeded demo site looked already-onboarded forever and never
+    actually got real segmentation. ``onboarded_at`` is set only here, on
+    a real successful call, so it can't be confused with a seeded guess.
     """
-    if site.shade_coverage_pct is not None and not force:
+    if site.onboarded_at is not None and not force:
         return site
 
     start_date = reference_date or date.today().isoformat()
@@ -144,5 +151,7 @@ def onboard_site(
     )
     site.streetview_image_path = str(streetview_image) if streetview_image else None
     site.streetview_legend = streetview_front.get("image_legend") or None
+
+    site.onboarded_at = now_naive_utc()
 
     return site

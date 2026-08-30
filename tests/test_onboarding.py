@@ -141,3 +141,57 @@ def test_onboarding_leaves_image_fields_null_when_api_returns_no_image():
     assert site.satellite_legend is None
     assert site.streetview_image_path is None
     assert site.streetview_legend is None
+
+
+def test_onboard_site_sets_onboarded_at_on_success():
+    client = _client_with({"tree": 30.0}, {"tree": 20.0, "building": 10.0})
+    site = _make_site()
+
+    assert site.onboarded_at is None
+
+    onboard_site(client, site)
+
+    assert site.onboarded_at is not None
+
+
+def test_a_site_seeded_with_only_an_estimated_shade_value_still_gets_real_onboarding():
+    """Real bug, live-observed in production: agent.seed.py pre-sets
+    shade_coverage_pct/canopy_pct to representative estimates (not derived
+    from a real satellite/streetview call) specifically so a fresh boot's
+    very first cycle doesn't silently spend Premium credits before anyone
+    can review it -- see seed.py's own docstring. But onboard_site() used
+    to treat "has *any* shade_coverage_pct" as its "already onboarded"
+    signal, so a seeded estimate was indistinguishable from real onboarding
+    output: satellite/streetview segmentation never actually ran for
+    either demo site, confirmed live via FortyGuard's own usage breakdown
+    showing zero Premium segmentation calls ever billed, and every score
+    this whole deployment used the seed's guess instead of FortyGuard's
+    real segmentation. onboarded_at (set only by a real, successful
+    onboard_site() call, never by seeding) is the correct, unambiguous
+    "has this site actually been onboarded" signal.
+    """
+    client = _client_with({"tree": 30.0}, {"tree": 20.0, "building": 10.0})
+    # Mirrors what agent.seed._DEMO_SITES actually ships: real-looking
+    # numbers, but never touched by onboard_site().
+    site = _make_site(shade_coverage_pct=18.0, canopy_pct=9.0)
+
+    onboard_site(client, site)
+
+    assert client.satellite_segmentation.call_count == 1
+    assert client.street_view_segmentation.call_count == 1
+    # The seed estimate is overwritten with FortyGuard's real result, not
+    # left in place because "shade data was already there".
+    assert site.shade_coverage_pct == pytest.approx(30.0)
+    assert site.canopy_pct == pytest.approx(30.0)
+    assert site.onboarded_at is not None
+
+
+def test_force_true_re_onboards_a_site_that_already_has_onboarded_at_set():
+    client = _client_with({"tree": 30.0}, {"tree": 20.0, "building": 10.0})
+    site = _make_site()
+
+    onboard_site(client, site)
+    onboard_site(client, site, force=True)
+
+    assert client.satellite_segmentation.call_count == 2
+    assert client.street_view_segmentation.call_count == 2

@@ -320,6 +320,62 @@ def test_pre_existing_database_gets_a_unique_index_backfilled_onto_sites_name(tm
     assert raised, "sites.name should be enforced unique even on a pre-existing database"
 
 
+def test_pre_existing_database_gets_sites_onboarded_at_column_backfilled(tmp_path):
+    """Code-review-caught: Site.onboarded_at (added to fix the seeded-demo-
+    site-never-really-onboarded bug -- see test_onboarding.py's
+    test_a_site_seeded_with_only_an_estimated_shade_value_still_gets_real_onboarding)
+    is only added by Base.metadata.create_all(), which creates *missing*
+    tables but never alters an already-existing one. A persisted
+    heatshield.db predating this column would raise
+    "no such column: sites.onboarded_at" on every query the instant the
+    ORM model above expects it to exist.
+
+    Simulates that exact pre-existing database (a bare `sites` table
+    without the column) and confirms opening it through db_session()
+    backfills it via a plain ALTER TABLE ADD COLUMN -- SQLite supports
+    this directly for a nullable column with no default, unlike the
+    UNIQUE-index case above which needed a full rebuild workaround.
+    """
+    db_path = tmp_path / "pre_existing_onboarded_at.db"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute(
+        """
+        CREATE TABLE sites (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            lat FLOAT NOT NULL,
+            lon FLOAT NOT NULL,
+            polygon_geojson TEXT NOT NULL,
+            shade_coverage_pct FLOAT,
+            canopy_pct FLOAT,
+            created_at DATETIME NOT NULL,
+            satellite_image_path VARCHAR,
+            satellite_legend TEXT,
+            streetview_image_path VARCHAR,
+            streetview_legend TEXT
+        )
+        """
+    )
+    raw_conn.commit()
+    raw_conn.close()
+
+    database_url = f"sqlite:///{db_path}"
+    with db_session(database_url) as session:
+        session.add(
+            Site(
+                name="Pre-existing Site",
+                lat=0.0,
+                lon=0.0,
+                polygon_geojson={"type": "Polygon", "coordinates": [[[0, 0]]]},
+                shade_coverage_pct=18.0,
+            )
+        )
+
+    with db_session(database_url) as session:
+        site = session.query(Site).one()
+        assert site.onboarded_at is None
+
+
 def test_concurrent_first_calls_do_not_race_on_table_creation(tmp_path):
     """Regression test: concurrent first-time db_session() calls against the
     same not-yet-cached URL used to race on Base.metadata.create_all(),
