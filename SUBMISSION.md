@@ -1,5 +1,7 @@
 # HeatShield Agent — Submission Summary
 
+Slack alerts workspace: https://join.slack.com/t/your-workspace-name/shared_invite/your-invite-code — join to see live heat-risk alerts as the agent sends them.
+
 ## Problem
 
 Outdoor crews (construction, warehousing, logistics, event staffing) face heat-illness risk that a plain ambient-temperature reading gets wrong. Two crews in the same city at the same hour face different real risk depending on their site's actual shade and how physically demanding their work is. The standard response — a safety officer checking a weather app and using judgment — doesn't scale, isn't logged for compliance, and isn't proactive about tomorrow's forecast.
