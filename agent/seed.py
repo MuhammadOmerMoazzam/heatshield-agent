@@ -21,9 +21,24 @@ still fire normally either way.
 
 from __future__ import annotations
 
+import threading
 from datetime import time
 
+from sqlalchemy.exc import IntegrityError
+
 from agent.models import Crew, Site
+
+# Real bug, live-observed: concurrent Streamlit reruns (separate threads
+# within one process) could each pass seed_demo_sites_if_empty's "any
+# site exists" check on a still-empty database before either had
+# committed its insert, resulting in duplicate demo sites. This lock
+# narrows that race for the common (same-process) case; the Site.name
+# UNIQUE constraint (agent/models.py) is what actually guarantees no
+# duplicates land regardless -- a session only becomes visible to other
+# sessions at commit, not at flush, so a lock alone (held only for the
+# duration of this function, not through the caller's later commit)
+# can't fully close the window on its own.
+_seed_lock = threading.Lock()
 
 PHOENIX_POLYGON = {
     "type": "FeatureCollection",
@@ -100,25 +115,36 @@ _DEMO_SITES = [
 def seed_demo_sites_if_empty(session) -> int:
     """Seed the standard demo sites (+one crew each) if no site exists yet.
 
-    Returns the number of sites created (0 if the table already has at
+    Returns the number of sites created (0 if the table already had at
     least one -- this is what makes repeated calls, e.g. on every
-    Streamlit rerun, safe).
+    Streamlit rerun, safe). See module-level _seed_lock and
+    Site.name's UNIQUE constraint (agent/models.py) for why a duplicate
+    insert from a concurrent caller is caught and treated as "already
+    seeded" rather than raising.
     """
-    if session.query(Site).first() is not None:
-        return 0
+    with _seed_lock:
+        if session.query(Site).first() is not None:
+            return 0
 
-    for spec in _DEMO_SITES:
-        site = Site(
-            name=spec["name"],
-            lat=spec["lat"],
-            lon=spec["lon"],
-            polygon_geojson=spec["polygon_geojson"],
-            shade_coverage_pct=spec["shade_coverage_pct"],
-            canopy_pct=spec["canopy_pct"],
-        )
-        session.add(site)
-        session.flush()
-        session.add(Crew(site_id=site.id, **spec["crew"]))
+        try:
+            with session.begin_nested():
+                for spec in _DEMO_SITES:
+                    site = Site(
+                        name=spec["name"],
+                        lat=spec["lat"],
+                        lon=spec["lon"],
+                        polygon_geojson=spec["polygon_geojson"],
+                        shade_coverage_pct=spec["shade_coverage_pct"],
+                        canopy_pct=spec["canopy_pct"],
+                    )
+                    session.add(site)
+                    session.flush()
+                    session.add(Crew(site_id=site.id, **spec["crew"]))
+                session.flush()
+        except IntegrityError:
+            # A concurrent caller won the race and already committed
+            # these sites (by name) between our check above and this
+            # insert -- not an error.
+            return 0
 
-    session.flush()
-    return len(_DEMO_SITES)
+        return len(_DEMO_SITES)

@@ -163,7 +163,28 @@ def query_site_dashboard_data(session) -> list[dict]:
                 "crew_scores": crew_scores,
             }
         )
-    return results
+    return _dedupe_sites_by_name(results)
+
+
+def _dedupe_sites_by_name(results: list[dict]) -> list[dict]:
+    """Guards against duplicate Site rows sharing the same name -- a real
+    bug hit live: concurrent Streamlit reruns could both pass
+    seed_demo_sites_if_empty's "any site exists" check on an empty
+    database before either committed, inserting the demo sites twice
+    (fixed at the source in agent/seed.py, but this keeps the dashboard
+    correct against rows already duplicated before that fix, or any
+    other future cause). Prefers whichever duplicate actually has a live
+    reading; order follows first-seen name (results already arrive
+    sorted by name).
+    """
+    by_name: dict[str, dict] = {}
+    for entry in results:
+        existing = by_name.get(entry["name"])
+        if existing is None or (
+            existing["latest_live_ts"] is None and entry["latest_live_ts"] is not None
+        ):
+            by_name[entry["name"]] = entry
+    return list(by_name.values())
 
 
 def query_decision_log(session, limit: int = 200) -> list[dict]:

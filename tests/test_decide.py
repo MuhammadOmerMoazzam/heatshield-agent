@@ -140,6 +140,31 @@ def test_high_tier_notify_message_points_to_dashboard_when_report_succeeds(tmp_p
     assert "dashboard" in notify_mock.call_args.args[0].lower()
 
 
+def test_high_tier_notify_message_includes_real_link_when_dashboard_url_configured(
+    tmp_path, mocker, monkeypatch
+):
+    """User-requested readability improvement: when DASHBOARD_URL is
+    configured, the message includes an actual clickable Slack mrkdwn
+    link (<url|label>) to the dashboard, not just a text mention --
+    that's as close as an incoming webhook (no file-attach capability)
+    can get to "download the PDF from Slack."
+    """
+    monkeypatch.setenv("DASHBOARD_URL", "https://heatshield-agent.streamlit.app")
+    notify_mock, schedule_mock, report_mock = _patch_actions(
+        mocker, notify_return="slack", report_return="/outputs/r.pdf"
+    )
+    client = MagicMock()
+
+    with db_session(f"sqlite:///{tmp_path / 't.db'}") as session:
+        site, crew, reading = _seed(session)
+        decide_and_act(
+            session, client, site, crew, reading, score=115.0, tier="high", trigger_type="live"
+        )
+
+    message = notify_mock.call_args.args[0]
+    assert "<https://heatshield-agent.streamlit.app|" in message
+
+
 def test_high_tier_notify_message_has_no_report_hint_when_report_fails(tmp_path, mocker):
     notify_mock, schedule_mock, report_mock = _patch_actions(
         mocker, notify_return="slack", report_return=None

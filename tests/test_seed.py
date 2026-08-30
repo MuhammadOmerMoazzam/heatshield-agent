@@ -8,8 +8,10 @@ exist -- idempotent, so it must be a safe no-op once any site is present.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from agent.models import Crew, Site, db_session
-from agent.seed import seed_demo_sites_if_empty
+from agent.seed import _DEMO_SITES, seed_demo_sites_if_empty
 
 
 def test_seed_demo_sites_if_empty_creates_sites_with_crews(tmp_path):
@@ -48,3 +50,29 @@ def test_seed_demo_sites_if_empty_is_a_no_op_once_any_site_exists(tmp_path):
 
         assert created == 0
         assert len(session.query(Site).all()) == 1
+
+
+def test_seed_demo_sites_if_empty_does_not_duplicate_under_concurrent_calls(tmp_path):
+    """Live-observed real bug: concurrent Streamlit reruns could each pass
+    the "any site exists" check on a still-empty database before either
+    had committed its insert, resulting in duplicate demo sites (e.g. two
+    "Phoenix, AZ ..." rows -- one accumulating real readings, the other
+    stuck at "no live reading yet" forever, both visible on the
+    dashboard). A lock serializes the check-then-insert across threads
+    within this process (Streamlit runs each session's script on its own
+    thread within one process), closing the race for the common case.
+    """
+    database_url = f"sqlite:///{tmp_path / 't.db'}"
+
+    def _seed_once(_: int) -> None:
+        with db_session(database_url) as session:
+            seed_demo_sites_if_empty(session)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(_seed_once, range(8)))
+
+    with db_session(database_url) as session:
+        names = [site.name for site in session.query(Site).all()]
+
+    assert len(names) == len(_DEMO_SITES)
+    assert len(names) == len(set(names))

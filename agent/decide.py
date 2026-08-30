@@ -38,6 +38,7 @@ future-dated request against it isn't valid input regardless of tier.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
 
 from agent._shared import now_naive_utc
@@ -77,6 +78,38 @@ def _try_act(func: Callable, *args: Any, **kwargs: Any) -> Any:
         return None
 
 
+def _format_action_message(
+    *,
+    prefix: str,
+    site_name: str,
+    crew_id: int,
+    action: str,
+    detail: str | None = None,
+    report_url: str | None = None,
+) -> str:
+    """Multi-line, Slack-mrkdwn-formatted alert (bold prefix, one fact per
+    line) rather than one long run-on sentence.
+
+    When ``report_url`` is set (a real compliance-report PDF exists),
+    includes a real clickable link to the dashboard if DASHBOARD_URL is
+    configured (Slack's incoming webhooks can't attach the PDF itself,
+    and it only ever lives on this server's local disk -- see module
+    docstring), or falls back to plain text pointing at the dashboard if
+    it isn't. Says nothing extra when there's no report at all.
+    """
+    lines = [f"*{prefix}* {site_name} — Crew {crew_id}"]
+    if detail:
+        lines.append(detail)
+    lines.append(f"Action: {action.replace('_', ' ')}")
+    if report_url:
+        dashboard_url = os.getenv("DASHBOARD_URL")
+        if dashboard_url:
+            lines.append(f"<{dashboard_url}|View compliance report & dashboard>")
+        else:
+            lines.append("Compliance report available on the dashboard.")
+    return "\n".join(lines)
+
+
 def decide_and_act(
     session,
     client: FortyGuardClient,
@@ -111,11 +144,14 @@ def decide_and_act(
 
     if is_forecast:
         if tier in ("high", "extreme"):
-            notified_channel = _try_act(
-                notify.notify_slack,
-                f"[FORECAST +12h] {site.name}: crew {crew.id} predicted to reach "
-                f"'{tier}' within 12h -> {action}",
+            message = _format_action_message(
+                prefix="[FORECAST +12h]",
+                site_name=site.name,
+                crew_id=crew.id,
+                action=action,
+                detail=f"Predicted to reach '{tier}' within 12h.",
             )
+            notified_channel = _try_act(notify.notify_slack, message)
             _try_act(schedule.write_shift_override, site.id, crew.id, "flag_for_reschedule")
         # No compliance report for a forecast -- see module docstring.
     elif tier == "caution":
@@ -123,17 +159,17 @@ def decide_and_act(
     elif tier in ("high", "extreme"):
         # Report generated before the Slack message is composed (not
         # after, as in Phase 6's original ordering) so the message can
-        # say whether one is actually available -- the PDF only ever
-        # lands on this server's own local disk (see module docstring:
-        # FortyGuard's signed download link is single-use), and Slack's
-        # incoming webhook can't attach files at all, so a plain "-> the
-        # dashboard" pointer is the most Slack can usefully say about it.
+        # say whether one is actually available.
         report_url = _try_act(
             compliance_report.generate_compliance_report, client, site, reading, tier
         )
-        message = f"[{tier.upper()}] {site.name}: crew {crew.id} -> {action}"
-        if report_url:
-            message += " (compliance report available on the dashboard)"
+        message = _format_action_message(
+            prefix=f"[{tier.upper()}]",
+            site_name=site.name,
+            crew_id=crew.id,
+            action=action,
+            report_url=report_url,
+        )
         notified_channel = _try_act(notify.notify_slack, message)
         _try_act(
             schedule.write_shift_override,

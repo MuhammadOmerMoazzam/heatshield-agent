@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CREDIT_FLOOR = 50_000
 DEFAULT_CHECK_CREDITS_EVERY_N_CYCLES = 10
+# Live-verified real cost: a single cycle (2 sites x live+forecast, each
+# needing a day-level create_heatmap call plus environmental_parameters
+# retries) has been observed spending on the order of 10-15% of a
+# 2,000,000-credit key. Onboarding's own credit_floor throttle doesn't
+# help here -- sensing is never throttled by design (see run_cycle's own
+# docstring) -- so the interval itself is the only real lever to keep a
+# demo-scale deployment from exhausting its credits within a day of
+# continuous operation. 6 hours still demonstrates the scheduler is
+# alive and updating on its own; reboot the app any time for an
+# immediate fresh cycle on demand (e.g. right before a judge looks).
+DEFAULT_INTERVAL_MINUTES = 360
 
 
 def _check_credits(client: FortyGuardClient, credit_floor: int) -> bool:
@@ -219,7 +230,7 @@ def run_once(
 
 def run_scheduler(
     *,
-    interval_minutes: int = 60,
+    interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
     credit_floor: int = DEFAULT_CREDIT_FLOOR,
     check_credits_every_n_cycles: int = DEFAULT_CHECK_CREDITS_EVERY_N_CYCLES,
 ):

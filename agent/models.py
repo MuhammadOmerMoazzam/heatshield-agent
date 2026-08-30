@@ -51,7 +51,15 @@ class Site(Base):
     __tablename__ = "sites"
 
     id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
+    # unique=True: real bug, live-observed -- concurrent Streamlit reruns
+    # could each pass agent.seed's "any site exists" check on a still-
+    # empty database before either committed, inserting the demo sites
+    # twice. This constraint is the authoritative, database-enforced
+    # guard against that (an in-process lock alone narrows the race but
+    # can't close it, since visibility to other sessions only happens at
+    # commit, not at flush) -- agent.seed catches the resulting
+    # IntegrityError and treats it as "already seeded," not an error.
+    name = Column(String, nullable=False, unique=True)
     lat = Column(Float, nullable=False)
     lon = Column(Float, nullable=False)
     polygon_geojson = Column(JSON, nullable=False)
